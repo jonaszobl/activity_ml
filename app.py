@@ -1,9 +1,7 @@
-# app.py
 import io
 import os
 import json
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +11,7 @@ import pandas as pd
 
 # dein Code:
 from src.predict_workout import (  # type: ignore
-    load_model, ensure_time_column_df, predict_features,
+    load_model, predict_features,
     smooth_probs_over_time, debounce_labels, segment_from_window_preds,
     merge_short_segments, strength_classes_from, select_rep_signal,
     estimate_rep_period_acf, count_reps_peak_trough, moving_average, mad
@@ -64,8 +62,8 @@ class PredictResponse(BaseModel):
 def _run_predict(df: pd.DataFrame, M: dict,
                  prob_smooth_k=5, debounce_run=3, merge_min_s=4.0,
                  rep_mode="pair", rep_min_s=0.6, rep_max_s=4.0, rep_k=0.6,
-                 acf_enable=True, acf_min_s=0.45, acf_max_s=3.0, acf_band=(0.6, 1.8),
-                 min_reps=4, below_min_policy="rest"):
+                 acf_enable=False, acf_min_s=0.45, acf_max_s=3.0, acf_band=(0.6, 1.8),
+                 min_reps=1, below_min_policy="keep"):
 
     classes = M["classes"]
     fs   = float(M["meta"]["fs_hz"])
@@ -73,11 +71,9 @@ def _run_predict(df: pd.DataFrame, M: dict,
     hopS = float(M["meta"]["hop_s"])
 
     # -------- robustes Zeit/Spalten-Handling (ohne Meta-Reihe) --------
-    # (1) Meta-Zeilen weg
     if "type" in df.columns:
         df = df[~(df["type"].astype(str) == "meta")].copy()
 
-    # (2) Zeitspalte bauen, falls nötig
     if "t" not in df.columns:
         if "t_rel" in df.columns:
             t_rel = pd.to_numeric(df["t_rel"], errors="coerce")
@@ -90,7 +86,6 @@ def _run_predict(df: pd.DataFrame, M: dict,
         else:
             raise HTTPException(status_code=400, detail="No time column: expected 't' or 't_rel'")
 
-    # (3) Numerisch casten und nur notwendige Zeilen behalten
     for col in ["t", "ax", "ay", "az"]:
         if col not in df.columns:
             raise HTTPException(status_code=400, detail=f"Missing column '{col}'")
@@ -207,59 +202,47 @@ async def predict_endpoint(
     rep_min_s: float = Form(0.6),
     rep_max_s: float = Form(4.0),
     rep_k: float = Form(0.6),
-    acf_enable: bool = Form(True),
+    acf_enable: bool = Form(False),         # Default geändert
     acf_min_s: float = Form(0.45),
     acf_max_s: float = Form(3.0),
     acf_band: str = Form("0.6,1.8"),
-    min_reps: int = Form(4),
-    below_min_policy: str = Form("rest")
+    min_reps: int = Form(1),                # Default geändert
+    below_min_policy: str = Form("keep")    # Default geändert
 ):
     if not MODEL_READY or MODEL_OBJ is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # parse acf_band
     try:
         lo, hi = [float(x) for x in acf_band.split(",")]
         acf_band_tuple = (lo, hi)
     except Exception:
         acf_band_tuple = (0.6, 1.8)
 
-    # --- Upload lesen ---
     data = await workout_file.read()
     text = data.decode("utf-8", errors="ignore")
     print(f"[predict] received {len(data)} bytes from {workout_file.filename}")
 
     rows = []
-    # (1) Bisheriger Weg (Railway)
     try:
         rows = list(read_jsonl_from_io(io.StringIO(text)))
     except Exception:
         rows = []
-    print("[predict] from_io:", len(rows))
-
-    # (2) Fallback: JSONL Zeile-für-Zeile
     if not rows:
-        tmp = []
         for ln in text.splitlines():
             s = ln.strip()
             if not s:
                 continue
             try:
                 obj = json.loads(s)
-                tmp.append(obj)
+                rows.append(obj)
             except Exception:
                 pass
-        rows = tmp
-    print("[predict] manual JSONL:", len(rows))
-
-    # (3) Fallback: JSON-Array / -Objekt
     if not rows:
         try:
             obj = json.loads(text)
             rows = obj if isinstance(obj, list) else [obj]
         except Exception:
             rows = []
-    print("[predict] json blob:", len(rows))
 
     if not rows:
         return PredictResponse(
