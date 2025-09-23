@@ -5,8 +5,9 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
+import numpy as np
+import pandas as pd
 
-# dein Code:
 from src.predict_workout import (  # type: ignore
     load_model, ensure_time_column_df, predict_features,
     smooth_probs_over_time, debounce_labels, segment_from_window_preds,
@@ -16,21 +17,26 @@ from src.predict_workout import (  # type: ignore
 from src.features import build_windows  # type: ignore
 from src.utils_jsonl import read_jsonl_from_io
 
-import numpy as np
-import pandas as pd
-
 MODEL_PATH = os.environ.get("MODEL_PATH", "artifacts/model.json")
 
 app = FastAPI(title="Bangle Workout API", version="1.0")
 
-# CORS (erlaube deine Domains – z. B. lovable.dev Preview + Prod)
+# ✅ CORS: Wildcard NUR ohne Credentials!
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # eng setzen in Produktion!
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,     # <- wichtig
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "bangle-workout-api"}
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
 
 class PredictResponse(BaseModel):
     model_version: str
@@ -38,6 +44,8 @@ class PredictResponse(BaseModel):
     win_s: float
     hop_s: float
     segments: list
+    model_config = {"protected_namespaces": ()}
+
 
 def _run_predict(df: pd.DataFrame, M: dict,
                  prob_smooth_k=5, debounce_run=3, merge_min_s=4.0,
