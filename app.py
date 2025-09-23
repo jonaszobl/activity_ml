@@ -178,7 +178,7 @@ async def predict_endpoint(
     rep_min_s: float = Form(0.6),
     rep_max_s: float = Form(4.0),
     rep_k: float = Form(0.6),
-    acf_enable: bool = Form(True),
+    acf_enable: bool = Form(False),
     acf_min_s: float = Form(0.45),
     acf_max_s: float = Form(3.0),
     acf_band: str = Form("0.6,1.8"),
