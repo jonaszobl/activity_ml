@@ -1,10 +1,10 @@
 import io
-import json
 import os
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+import numpy as np
+import pandas as pd
 
 # dein Code:
 from src.predict_workout import (  # type: ignore
@@ -14,24 +14,38 @@ from src.predict_workout import (  # type: ignore
     estimate_rep_period_acf, count_reps_peak_trough, moving_average, mad
 )
 from src.features import build_windows  # type: ignore
-from src.utils_jsonl import read_jsonl_from_io
-
-import numpy as np
-import pandas as pd
+from src.utils_jsonl import read_jsonl_from_io  # type: ignore
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "artifacts/model.json")
 
 app = FastAPI(title="Bangle Workout API", version="1.0")
 
-# CORS (erlaube deine Domains – z. B. lovable.dev Preview + Prod)
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # eng setzen in Produktion!
+    allow_origins=["*"],   # in Prod enger setzen
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ---- Health / Ready ----
+MODEL_OBJ = None
+MODEL_READY = False
+
+@app.get("/", include_in_schema=False)
+@app.get("/health", include_in_schema=False)
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    # einfacher Liveliness-Check
+    return {"status": "ok", "ready": bool(MODEL_READY)}
+
+@app.get("/readyz", include_in_schema=False)
+def readyz():
+    # expliziter Readiness-Check (Modell geladen?)
+    return {"ready": bool(MODEL_READY)}
+
+# ---- Pydantic Response ----
 class PredictResponse(BaseModel):
     model_version: str
     fs_hz: float
@@ -39,10 +53,14 @@ class PredictResponse(BaseModel):
     hop_s: float
     segments: list
 
+    # Fix für Warnung: "model_version" vs. protected namespace "model_"
+    model_config = {"protected_namespaces": ()}
+
+# ---- Inferenz ----
 def _run_predict(df: pd.DataFrame, M: dict,
                  prob_smooth_k=5, debounce_run=3, merge_min_s=4.0,
                  rep_mode="pair", rep_min_s=0.6, rep_max_s=4.0, rep_k=0.6,
-                 acf_enable=True, acf_min_s=0.45, acf_max_s=3.0, acf_band=(0.6,1.8),
+                 acf_enable=True, acf_min_s=0.45, acf_max_s=3.0, acf_band=(0.6, 1.8),
                  min_reps=4, below_min_policy="rest"):
 
     classes = M["classes"]
@@ -57,16 +75,13 @@ def _run_predict(df: pd.DataFrame, M: dict,
 
     model_feats = M.get("feature_names", [])
     assert len(model_feats) == X.shape[1], "Feature count mismatch – Modell neu trainieren?"
-    if model_feats and feat_names != model_feats:
-        # Warnung, aber wir rechnen weiter
-        pass
+    # Wenn vorhanden aber abweichend: wir rechnen weiter (nur Hinweis)
+    # if model_feats and feat_names != model_feats: pass
 
     # Fensterweise Klassifikation
     cls_idx, probs = predict_features(X, M)
-    # Probs glätten
     probs_s = smooth_probs_over_time(probs, k=max(1, int(prob_smooth_k)))
     cls_idx = np.argmax(probs_s, axis=1)
-    # Entprellen
     cls_idx = debounce_labels(cls_idx, min_run=max(1, int(debounce_run)))
 
     # Segmentierung
@@ -81,7 +96,6 @@ def _run_predict(df: pd.DataFrame, M: dict,
     ay = df["ay"].to_numpy(float)
     az = df["az"].to_numpy(float)
 
-    # für peaks-Mode: leichte Glättung der Z-Achse (Kompatibilität)
     smooth_k = max(1, int(round(0.2 * fs)))
     az_smooth = moving_average(az, smooth_k)
 
@@ -94,18 +108,15 @@ def _run_predict(df: pd.DataFrame, M: dict,
         if seg_class in strength_classes and np.count_nonzero(mask) > 3:
             if rep_mode == "pair":
                 sig = select_rep_signal(ax[mask], ay[mask], az[mask], fs)
-
-                # Klassenspezifische Parameter aus deinem Python:
-                from src.predict_workout import rep_params_for_class
+                from src.predict_workout import rep_params_for_class  # type: ignore
                 k0, min0, max0 = rep_params_for_class(seg_class, base_k=float(rep_k),
                                                       base_min=float(rep_min_s), base_max=float(rep_max_s))
-
                 if acf_enable:
                     p = estimate_rep_period_acf(sig, fs, min_s=float(acf_min_s), max_s=float(acf_max_s))
                     if p > 0:
                         lo, hi = acf_band
-                        min_s = max(0.35, min(p*lo, max0))
-                        max_s = max(min0, min(p*hi, max0))
+                        min_s = max(0.35, min(p * lo, max0))
+                        max_s = max(min0, min(p * hi, max0))
                     else:
                         min_s, max_s = min0, max0
                 else:
@@ -119,8 +130,7 @@ def _run_predict(df: pd.DataFrame, M: dict,
                     k_try = max(0.25, k0 - 0.1)
                     reps = count_reps_peak_trough(sig, fs, k=k_try, min_rep_s=min_s, max_rep_s=max_s)
             else:
-                # Peaks-Mode
-                from src.predict_workout import count_peaks
+                from src.predict_workout import count_peaks  # type: ignore
                 reps = count_peaks(
                     az_smooth[mask], fs,
                     min_separation_s=0.4,
@@ -146,16 +156,21 @@ def _run_predict(df: pd.DataFrame, M: dict,
 
     return results, fs, winS, hopS
 
+# ---- Startup: Modell laden ----
 @app.on_event("startup")
 def _load_model_once():
-    # Modell lazy global load
-    global MODEL_OBJ
-    MODEL_OBJ = load_model(MODEL_PATH)
+    global MODEL_OBJ, MODEL_READY
+    try:
+        MODEL_OBJ = load_model(MODEL_PATH)
+        MODEL_READY = True
+    except Exception:
+        MODEL_READY = False
+        # App bleibt live (Health 200), Readiness  false -> /readyz zeigt es an.
 
+# ---- API ----
 @app.post("/predict", response_model=PredictResponse)
 async def predict_endpoint(
-    workout_file: UploadFile = File(...),   # erwartet workout.txt (JSONL)
-    # Optional: Parametrisierung (Defaults wie in deinem Script)
+    workout_file: UploadFile = File(...),  # erwartet workout.txt (JSONL)
     prob_smooth_k: int = Form(5),
     debounce_run: int = Form(3),
     merge_min_s: float = Form(4.0),
@@ -183,10 +198,10 @@ async def predict_endpoint(
     rows = list(read_jsonl_from_io(io_buf))
     if not rows:
         return PredictResponse(
-            model_version=MODEL_OBJ.get("version", "v1"),
-            fs_hz=float(MODEL_OBJ["meta"]["fs_hz"]),
-            win_s=float(MODEL_OBJ["meta"]["win_s"]),
-            hop_s=float(MODEL_OBJ["meta"]["hop_s"]),
+            model_version=(MODEL_OBJ or {}).get("version", "v1"),
+            fs_hz=float((MODEL_OBJ or {"meta": {"fs_hz": 50}})["meta"]["fs_hz"]),
+            win_s=float((MODEL_OBJ or {"meta": {"win_s": 2}})["meta"]["win_s"]),
+            hop_s=float((MODEL_OBJ or {"meta": {"hop_s": 0.5}})["meta"]["hop_s"]),
             segments=[]
         )
 
