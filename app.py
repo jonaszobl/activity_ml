@@ -1,6 +1,11 @@
+# app.py
 import io
 import os
-from fastapi import FastAPI, UploadFile, File, Form
+import json
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
@@ -16,7 +21,10 @@ from src.predict_workout import (  # type: ignore
 from src.features import build_windows  # type: ignore
 from src.utils_jsonl import read_jsonl_from_io  # type: ignore
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "artifacts/model.json")
+# --- robuster Modellpfad ---
+HERE = Path(__file__).resolve().parent
+DEFAULT_MODEL = HERE / "artifacts" / "model.json"
+MODEL_PATH = os.environ.get("MODEL_PATH", str(DEFAULT_MODEL))
 
 app = FastAPI(title="Bangle Workout API", version="1.0")
 
@@ -37,12 +45,10 @@ MODEL_READY = False
 @app.get("/health", include_in_schema=False)
 @app.get("/healthz", include_in_schema=False)
 def healthz():
-    # einfacher Liveliness-Check
     return {"status": "ok", "ready": bool(MODEL_READY)}
 
 @app.get("/readyz", include_in_schema=False)
 def readyz():
-    # expliziter Readiness-Check (Modell geladen?)
     return {"ready": bool(MODEL_READY)}
 
 # ---- Pydantic Response ----
@@ -52,8 +58,6 @@ class PredictResponse(BaseModel):
     win_s: float
     hop_s: float
     segments: list
-
-    # Fix für Warnung: "model_version" vs. protected namespace "model_"
     model_config = {"protected_namespaces": ()}
 
 # ---- Inferenz ----
@@ -68,15 +72,39 @@ def _run_predict(df: pd.DataFrame, M: dict,
     winS = float(M["meta"]["win_s"])
     hopS = float(M["meta"]["hop_s"])
 
-    df = ensure_time_column_df(df).sort_values("t").reset_index(drop=True)
+    # -------- robustes Zeit/Spalten-Handling (ohne Meta-Reihe) --------
+    # (1) Meta-Zeilen weg
+    if "type" in df.columns:
+        df = df[~(df["type"].astype(str) == "meta")].copy()
+
+    # (2) Zeitspalte bauen, falls nötig
+    if "t" not in df.columns:
+        if "t_rel" in df.columns:
+            t_rel = pd.to_numeric(df["t_rel"], errors="coerce")
+            valid = t_rel[t_rel.notna()]
+            if not valid.empty:
+                t0 = valid.iloc[0]
+                df["t"] = t_rel - t0
+            else:
+                df["t"] = np.nan
+        else:
+            raise HTTPException(status_code=400, detail="No time column: expected 't' or 't_rel'")
+
+    # (3) Numerisch casten und nur notwendige Zeilen behalten
+    for col in ["t", "ax", "ay", "az"]:
+        if col not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Missing column '{col}'")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["t", "ax", "ay", "az"]).sort_values("t").reset_index(drop=True)
+
+    # -------- Feature-Fenster --------
     X, _, t0s, feat_names = build_windows(df, fs, winS, hopS)
     if X.shape[0] == 0:
         return [], fs, winS, hopS
 
     model_feats = M.get("feature_names", [])
     assert len(model_feats) == X.shape[1], "Feature count mismatch – Modell neu trainieren?"
-    # Wenn vorhanden aber abweichend: wir rechnen weiter (nur Hinweis)
-    # if model_feats and feat_names != model_feats: pass
 
     # Fensterweise Klassifikation
     cls_idx, probs = predict_features(X, M)
@@ -89,7 +117,7 @@ def _run_predict(df: pd.DataFrame, M: dict,
     if merge_min_s and merge_min_s > 0:
         segments = merge_short_segments(segments, min_len_s=float(merge_min_s), prefer="neighbor")
 
-    # Reps je Segment (nur Kraftklassen)
+    # Reps je Segment
     strength_classes = strength_classes_from(M)
     t  = df["t"].to_numpy(float)
     ax = df["ax"].to_numpy(float)
@@ -163,14 +191,15 @@ def _load_model_once():
     try:
         MODEL_OBJ = load_model(MODEL_PATH)
         MODEL_READY = True
-    except Exception:
+        print(f"[startup] model loaded: {MODEL_PATH}")
+    except Exception as e:
         MODEL_READY = False
-        # App bleibt live (Health 200), Readiness  false -> /readyz zeigt es an.
+        print(f"[startup] model load failed: {MODEL_PATH} -> {e}")
 
 # ---- API ----
 @app.post("/predict", response_model=PredictResponse)
 async def predict_endpoint(
-    workout_file: UploadFile = File(...),  # erwartet workout.txt (JSONL)
+    workout_file: UploadFile = File(...),
     prob_smooth_k: int = Form(5),
     debounce_run: int = Form(3),
     merge_min_s: float = Form(4.0),
@@ -178,13 +207,16 @@ async def predict_endpoint(
     rep_min_s: float = Form(0.6),
     rep_max_s: float = Form(4.0),
     rep_k: float = Form(0.6),
-    acf_enable: bool = Form(False),
+    acf_enable: bool = Form(True),
     acf_min_s: float = Form(0.45),
     acf_max_s: float = Form(3.0),
     acf_band: str = Form("0.6,1.8"),
     min_reps: int = Form(4),
     below_min_policy: str = Form("rest")
 ):
+    if not MODEL_READY or MODEL_OBJ is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     # parse acf_band
     try:
         lo, hi = [float(x) for x in acf_band.split(",")]
@@ -192,10 +224,43 @@ async def predict_endpoint(
     except Exception:
         acf_band_tuple = (0.6, 1.8)
 
-    # JSONL lesen
+    # --- Upload lesen ---
     data = await workout_file.read()
-    io_buf = io.StringIO(data.decode("utf-8", errors="ignore"))
-    rows = list(read_jsonl_from_io(io_buf))
+    text = data.decode("utf-8", errors="ignore")
+    print(f"[predict] received {len(data)} bytes from {workout_file.filename}")
+
+    rows = []
+    # (1) Bisheriger Weg (Railway)
+    try:
+        rows = list(read_jsonl_from_io(io.StringIO(text)))
+    except Exception:
+        rows = []
+    print("[predict] from_io:", len(rows))
+
+    # (2) Fallback: JSONL Zeile-für-Zeile
+    if not rows:
+        tmp = []
+        for ln in text.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                tmp.append(obj)
+            except Exception:
+                pass
+        rows = tmp
+    print("[predict] manual JSONL:", len(rows))
+
+    # (3) Fallback: JSON-Array / -Objekt
+    if not rows:
+        try:
+            obj = json.loads(text)
+            rows = obj if isinstance(obj, list) else [obj]
+        except Exception:
+            rows = []
+    print("[predict] json blob:", len(rows))
+
     if not rows:
         return PredictResponse(
             model_version=(MODEL_OBJ or {}).get("version", "v1"),
@@ -206,6 +271,8 @@ async def predict_endpoint(
         )
 
     df = pd.DataFrame(rows)
+    print("[predict] df columns:", df.columns.tolist(), "len:", len(df))
+
     segments, fs, winS, hopS = _run_predict(
         df, MODEL_OBJ,
         prob_smooth_k=prob_smooth_k, debounce_run=debounce_run, merge_min_s=merge_min_s,

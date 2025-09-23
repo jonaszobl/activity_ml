@@ -1,0 +1,22 @@
+# Python venv
+venv/
+ENV/
+env/
+.venv/
+
+# Lokale Test-Skripte
+src/test_local.py
+
+data
+
+# Bytecode / Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Sonstiges
+*.log
+*.tmp
+*.swp
+.DS_Store
