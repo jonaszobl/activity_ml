@@ -3,13 +3,11 @@ import json
 import sys
 import argparse
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
 from .utils_jsonl import read_jsonl
-from .features import build_windows
-
+from .features import build_windows, rfft_band_features  # features.py bleibt unverändert
 
 # ---------- Mathe / Utils ----------
 def softmax(z):
@@ -20,7 +18,6 @@ def softmax(z):
     return e / s if s > 0 else np.ones_like(e) / len(e)
 
 def moving_average(x: np.ndarray, k: int) -> np.ndarray:
-    """Einfaches gleitendes Mittel (Fenster k, unzentriert)."""
     if k <= 1:
         return x.astype(float, copy=True)
     k = int(k)
@@ -37,19 +34,14 @@ def median(a):
     return float(np.median(a))
 
 def mad(a):
-    """Median Absolute Deviation."""
     m = median(a)
     return float(np.median(np.abs(np.asarray(a, float) - m)))
-
 
 # ---------- Peak-basierte Zählung (optional) ----------
 def count_peaks(signal: np.ndarray, fs: float,
                 min_separation_s: float = 0.4,
                 thresh_mode: str = "median_mad",
                 prominence: float = 0.0) -> int:
-    """
-    Einfache Peak-Erkennung (für --rep_mode peaks).
-    """
     if len(signal) < 3:
         return 0
     if thresh_mode == "median_mad":
@@ -75,21 +67,16 @@ def count_peaks(signal: np.ndarray, fs: float,
             last = i
     return peaks
 
-
 # ---------- Pair-Zählung (empfohlen) ----------
 def count_reps_peak_trough(signal: np.ndarray, fs: float,
                            k: float = 0.6,
                            min_rep_s: float = 0.6,
                            max_rep_s: float = 4.0) -> int:
-    """
-    Zählt Wiederholungen als Peak↔Trough-Transitions mit dynamischen Schwellwerten.
-    """
     n = len(signal)
     if n < 3:
         return 0
     med = median(signal)
     m = mad(signal)
-    # Falls sehr geringe Amplitude: Fallback auf Std
     if m < 1e-6:
         m = np.std(signal) * 0.8
     if m < 1e-6:
@@ -105,7 +92,6 @@ def count_reps_peak_trough(signal: np.ndarray, fs: float,
     for i in range(1, n - 1):
         s0, s1, s2 = signal[i - 1], signal[i], signal[i + 1]
         t = i / fs
-        # lokaler Peak über up
         if s1 > up and s1 > s0 and s1 > s2:
             if last_ext_type == "trough":
                 dt = t - last_ext_t
@@ -113,7 +99,6 @@ def count_reps_peak_trough(signal: np.ndarray, fs: float,
                     reps += 1
             last_ext_t = t
             last_ext_type = "peak"
-        # lokales Minimum unter down
         elif s1 < down and s1 < s0 and s1 < s2:
             if last_ext_type == "peak":
                 dt = t - last_ext_t
@@ -123,13 +108,8 @@ def count_reps_peak_trough(signal: np.ndarray, fs: float,
             last_ext_type = "trough"
     return reps
 
-
 # ---------- Signalwahl & Periodenschätzung ----------
 def highpass_ma(x: np.ndarray, fs: float, cutoff_s: float = 0.7) -> np.ndarray:
-    """
-    Sehr einfacher Highpass: remove gravity via moving-average subtraction.
-    cutoff_s ≈ Fensterlänge für Trend (Gravitation) – 0.6–1.0s funktioniert gut.
-    """
     k = max(1, int(round(cutoff_s * fs)))
     trend = moving_average(x, k)
     y = x.astype(float) - trend
@@ -137,9 +117,6 @@ def highpass_ma(x: np.ndarray, fs: float, cutoff_s: float = 0.7) -> np.ndarray:
 
 def _acf_primary_peak(signal: np.ndarray, fs: float,
                       min_s: float, max_s: float):
-    """
-    Liefert (period_s, peak_val) des ersten signifikanten ACF-Peaks im Suchfenster.
-    """
     n = len(signal)
     if n < int(fs * min_s) + 3:
         return 0.0, 0.0
@@ -156,7 +133,6 @@ def _acf_primary_peak(signal: np.ndarray, fs: float,
     if max_lag <= min_lag:
         return 0.0, 0.0
 
-    # Erster lokaler Max im Fenster
     lag = None
     for i in range(min_lag + 1, max_lag - 1):
         if ac[i] > ac[i - 1] and ac[i] > ac[i + 1]:
@@ -172,19 +148,12 @@ def estimate_rep_period_acf(signal: np.ndarray, fs: float,
     return p
 
 def select_rep_signal(ax: np.ndarray, ay: np.ndarray, az: np.ndarray, fs: float) -> np.ndarray:
-    """
-    Wählt pro Segment das „beste“ Signal:
-    - Kandidaten: highpass+smooth für ax, ay, az, sowie Magnitude sqrt(ax^2+ay^2+az^2)
-    - Bewertung: ACF-Peakhöhe; Fallback: größte Std
-    """
-    # Highpass
     xhp = highpass_ma(ax, fs, 0.7)
     yhp = highpass_ma(ay, fs, 0.7)
     zhp = highpass_ma(az, fs, 0.7)
     mag = np.sqrt(ax**2 + ay**2 + az**2)
     maghp = highpass_ma(mag, fs, 0.7)
 
-    # leichte Glättung
     k = max(1, int(round(0.16 * fs)))
     xs = moving_average(xhp, k)
     ys = moving_average(yhp, k)
@@ -197,11 +166,10 @@ def select_rep_signal(ax: np.ndarray, ay: np.ndarray, az: np.ndarray, fs: float)
         _, peak = _acf_primary_peak(sig, fs, 0.4, 3.0)
         scores.append(peak if np.isfinite(peak) else 0.0)
     best = int(np.argmax(scores))
-    if scores[best] < 0.05:  # sehr schwache Periodizität → Fallback auf Std
+    if scores[best] < 0.05:
         stds = np.array([np.std(c) for c in cands])
         best = int(np.argmax(stds))
     return cands[best]
-
 
 # ---------- Modell / IO ----------
 def load_model(path="artifacts/model.json"):
@@ -209,7 +177,6 @@ def load_model(path="artifacts/model.json"):
         return json.load(f)
 
 def predict_features(X: np.ndarray, M: dict):
-    # Standardisieren wie im Training
     mean = np.asarray(M["scaler_mean"], float)
     scale = np.asarray(M["scaler_scale"], float)
     Xn = (X - mean) / scale
@@ -220,15 +187,13 @@ def predict_features(X: np.ndarray, M: dict):
     cls_idx = np.argmax(probs, axis=1)
     return cls_idx, probs
 
-
 # ---------- DataFrame Helpers ----------
 def ensure_time_column_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Sorgt dafür, dass eine Spalte 't' (Sekunden, relativ zum Start) existiert."""
     if "t" in df.columns:
         t = pd.to_numeric(df["t"], errors="coerce")
     elif "t_rel" in df.columns:
         t_rel = pd.to_numeric(df["t_rel"], errors="coerce")
-        t = t_rel - t_rel.iloc[0]  # relativ zum Dateistart
+        t = t_rel - t_rel.iloc[0]
     else:
         raise KeyError("Weder 't' noch 't_rel' in Datei gefunden.")
     df = df.copy()
@@ -238,7 +203,6 @@ def ensure_time_column_df(df: pd.DataFrame) -> pd.DataFrame:
     assert not missing, f"Spalten fehlen: {missing}"
     df = df.dropna(subset=["t"])
     return df
-
 
 # ---------- Post-Processing für stabilere Segmente ----------
 def smooth_probs_over_time(probs: np.ndarray, k: int = 5) -> np.ndarray:
@@ -347,8 +311,7 @@ def seconds_to_hms(sec: float) -> str:
         return f"{h:d}:{m:02d}:{s:02d}"
     return f"{m:d}:{s:02d}"
 
-
-# ---------- Klassen-Heuristiken ----------
+# ---------- Klassen-Heuristiken (für Reps) ----------
 def class_name_key(name: str) -> str:
     u = str(name).upper()
     if "TRICEPS" in u and "PULL" in u:
@@ -362,15 +325,10 @@ def class_name_key(name: str) -> str:
     return "DEFAULT"
 
 def rep_params_for_class(name: str, base_k: float, base_min: float, base_max: float):
-    """
-    Klassenabhängige Feineinstellungen:
-    - Cable Fly: kleinere Amplituden -> niedrigere Schwelle (k - 0.20), etwas längere max-Dauer
-    - Triceps Pulldown: oft schnell & „wobbelig“ -> höhere Schwelle (k + 0.10), längere min-Dauer
-    """
     key = class_name_key(name)
     if key == "CABLE_FLY":
         k = max(0.30, base_k - 0.20)
-        return k, base_min, max(base_max, base_min + 2.6)  # etwas großzügiger oben
+        return k, base_min, max(base_max, base_min + 2.6)
     if key == "TRICEPS_PULLDOWN":
         k = min(1.0, base_k + 0.10)
         return k, max(base_min, 0.70), base_max
@@ -380,6 +338,263 @@ def rep_params_for_class(name: str, base_k: float, base_min: float, base_max: fl
         return base_k, base_min, base_max
     return base_k, base_min, base_max
 
+# ---------- Post-Filter Defaults (Basis) ----------
+POST_DEFAULTS = dict(
+    # --- Basis-Werte (werden per Klasse weiter verfeinert) ---
+    min_strength_duration_s = 8.0,   # <8 s: sehr wahrscheinlich kein echter Satz
+    min_rest_between_sets_s = 10.0,  # Pflicht-Ruhe zwischen zwei Kraft-Sets
+    acf_peak_thr            = 0.18,  # Periodizität muss spürbar sein
+    band_ratio_thr          = 0.35,  # Anteil 0.3–3 Hz hoch genug
+    std_thr_g               = 0.05,  # Mindest-Amplitude (g) nach Highpass+Smooth
+    min_rep_density         = 0.25,  # reps/duration_s
+    conf_thr                = 0.50   # mittlere Segment-Confidence
+)
+
+# ============================================
+# Klassenspezifische Schwellen (Hyperfunktion)
+# – hier passe ich je Übung meine Filter-Werte an.
+#   Kommentare bewusst stichartig – „aus dem Kopf“.
+# ============================================
+CLASS_THRESH = {
+
+    # --- Brust / Fly ---
+    "CABLE_FLY_CHEST": dict(
+        acf_peak_thr=0.13,      # weiche Bewegung; Peak eher klein
+        band_ratio_thr=0.25,    # wenig 0.3–3Hz-Energie; langsam/sauber
+        std_thr_g=0.030,        # kaum G-Ausschlag am Handgelenk
+        min_rep_density=0.17,   # 1 rep ~6s ok; kontrolliert
+        conf_thr=0.40,          # Modell oft unsicher → gnädiger
+        min_strength_duration_s=10.0  # Sätze meist länger
+    ),
+
+    # --- Bankdrücken Langhantel ---
+    "BENCH_BB": dict(
+        acf_peak_thr=0.16,      # klarer Rhythmus, aber Auflage dämpft
+        band_ratio_thr=0.32,    # moderate Frequenzkomponente
+        std_thr_g=0.045,        # etwas mehr Ausschlag als Fly
+        min_rep_density=0.22,   # ~1 rep pro 4.5s normal
+        conf_thr=0.45,
+        min_strength_duration_s=8.0
+    ),
+
+    # --- Bankdrücken Kurzhanteln ---
+    "BENCH_DB": dict(
+        acf_peak_thr=0.15,      # ungleichmäßiger → etwas kleiner
+        band_ratio_thr=0.28,
+        std_thr_g=0.040,        # Stabilisierung senkt Amplitude
+        min_rep_density=0.20,
+        conf_thr=0.40,
+        min_strength_duration_s=9.0
+    ),
+
+    # --- Trizeps-Kabelzug ---
+    "TRICEPS_PULLDOWN": dict(
+        acf_peak_thr=0.15,      # schnell/gleichmäßig, aber kleine Amplitude
+        band_ratio_thr=0.30,
+        std_thr_g=0.038,        # Handgelenk bewegt wenig
+        min_rep_density=0.23,   # ~1 rep pro 4.3s
+        conf_thr=0.45,
+        min_strength_duration_s=8.0
+    ),
+
+    # --- Schulterdrücken ---
+    "SHOULDER_PRESS": dict(
+        acf_peak_thr=0.17,      # Totpunkt oben → Peak nicht riesig
+        band_ratio_thr=0.33,
+        std_thr_g=0.042,
+        min_rep_density=0.22,
+        conf_thr=0.45,
+        min_strength_duration_s=9.0
+    ),
+
+    # --- Seitheben Kabel ---
+    "LATERAL_RAISE_CABLE": dict(
+        acf_peak_thr=0.12,      # kleine Range → Peak schwächer
+        band_ratio_thr=0.24,
+        std_thr_g=0.028,        # sehr wenig G-Schub
+        min_rep_density=0.18,
+        conf_thr=0.35,
+        min_strength_duration_s=9.0
+    ),
+
+    # --- Bizeps einarmig KH ---
+    "BIZEPS_CURL_H": dict(
+        acf_peak_thr=0.16,
+        band_ratio_thr=0.30,
+        std_thr_g=0.040,
+        min_rep_density=0.22,
+        conf_thr=0.45,
+        min_strength_duration_s=8.0
+    ),
+
+    # --- Bizeps beidarmig ---
+    "BIZEPS_CURL": dict(
+        acf_peak_thr=0.15,      # gleichmäßig, Peak etwas kleiner
+        band_ratio_thr=0.28,
+        std_thr_g=0.038,
+        min_rep_density=0.21,
+        conf_thr=0.45,
+        min_strength_duration_s=8.0
+    ),
+
+    # --- Rudern (Kabel/Maschine) ---
+    "RUDERN": dict(
+        acf_peak_thr=0.12,      # träge Bewegung → Peak flach
+        band_ratio_thr=0.22,
+        std_thr_g=0.035,        # Armzug am HG kaum „Impuls“
+        min_rep_density=0.15,   # 1 rep ~6–7s ok (ruhig)
+        conf_thr=0.35,          # oft unsicher → toleranter
+        min_strength_duration_s=9.0
+    ),
+}
+
+def thresholds_for_class(name: str, base: dict):
+    """
+    Mischt Basis-Defaults (base) mit Klassenspezifischen Overrides aus CLASS_THRESH.
+    -> so kann ich pro Übung feinjustieren, ohne das Modell anzufassen.
+    """
+    u = str(name).upper()
+    overrides = CLASS_THRESH.get(u, {})
+    cfg = dict(base)
+    cfg.update({k: overrides[k] for k in overrides})
+    return cfg
+
+# ---------- Guards (pro Segment) ----------
+def _segment_signal_guards(ax, ay, az, fs):
+    sig = select_rep_signal(ax, ay, az, fs)
+    std_best = float(np.std(sig)) if len(sig) else 0.0
+    _, acf_peak = _acf_primary_peak(sig, fs, 0.4, 3.0)
+    _, band_ratio, _, _, _ = rfft_band_features(sig, fs, 0.3, 3.0)
+    return std_best, float(acf_peak), float(band_ratio)
+
+# ---------- Zentrales Postprocessing ----------
+def apply_post_filters(df, segments, probs_s, classes, fs, strength_classes, cfg=POST_DEFAULTS):
+    if not segments:
+        return segments
+
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    sc_upper = {s.upper() for s in strength_classes}
+
+    def is_strength(c):
+        return str(c).upper() in sc_upper
+
+    def mean_conf_for_segment(seg):
+        if "i0" in seg and "i1" in seg and probs_s is not None:
+            ci = class_to_idx.get(seg["class"], None)
+            if ci is None:
+                return 0.0
+            i0, i1 = int(seg["i0"]), int(seg["i1"])
+            i1 = max(i0+1, i1)
+            p = probs_s[i0:i1, ci]
+            if p.size > 0:
+                return float(np.mean(p))
+        return 0.0
+
+    t = df["t"].to_numpy(float)
+    ax = df["ax"].to_numpy(float)
+    ay = df["ay"].to_numpy(float)
+    az = df["az"].to_numpy(float)
+
+    # 1) Harte Regeln & Signal-Guards
+    for s in segments:
+        dur = float(s["duration_s"])
+        # — dynamische Schwellen für diese Klasse —
+        cfg_c = thresholds_for_class(s["class"], cfg)
+
+        # a) Übung ohne Reps -> REST
+        if is_strength(s["class"]) and int(s.get("reps", 0)) == 0:
+            s["class"] = "REST"; s["reps"] = 0; continue
+        # b) Mindestdauer
+        if is_strength(s["class"]) and dur < cfg_c["min_strength_duration_s"]:
+            s["class"] = "REST"; s["reps"] = 0; continue
+        # c) Guards
+        if is_strength(s["class"]):
+            mask = (t >= s["t0"]) & (t <= s["t1"])
+            if np.count_nonzero(mask) >= int(0.8*fs):
+                std_best, acf_peak, band_ratio = _segment_signal_guards(ax[mask], ay[mask], az[mask], fs)
+                rep_density = (s.get("reps", 0) / max(1e-9, dur))
+                if (std_best < cfg_c["std_thr_g"] or 
+                    acf_peak < cfg_c["acf_peak_thr"] or 
+                    band_ratio < cfg_c["band_ratio_thr"] or
+                    rep_density < cfg_c["min_rep_density"]):
+                    s["class"] = "REST"; s["reps"] = 0; continue
+            else:
+                s["class"] = "REST"; s["reps"] = 0; continue
+        # d) Confidence (falls vorhanden)
+        if is_strength(s["class"]):
+            mc = mean_conf_for_segment(s)
+            if mc < cfg_c["conf_thr"]:
+                s["class"] = "REST"; s["reps"] = 0; continue
+
+    # 2) Pflicht-Rest zwischen zwei Kraft-Segmenten
+    i = 1
+    while i < len(segments):
+        a, b = segments[i-1], segments[i]
+        if is_strength(a["class"]) and is_strength(b["class"]):
+            gap = float(b["t0"] - a["t1"])
+            if gap < cfg["min_rest_between_sets_s"]:
+                ka = (a.get("reps",0), a["duration_s"])
+                kb = (b.get("reps",0), b["duration_s"])
+                turn_rest = a if (ka < kb) else b
+                turn_rest["class"] = "REST"
+                turn_rest["reps"]  = 0
+                i = max(1, i-1)
+                continue
+        i += 1
+
+    # 3) REST-Glättung & Merges
+    out = []
+    for s in segments:
+        if out and out[-1]["class"] == "REST" and s["class"] == "REST":
+            out[-1]["t1"] = max(out[-1]["t1"], s["t1"])
+            out[-1]["duration_s"] = float(out[-1]["t1"] - out[-1]["t0"])
+        else:
+            out.append(s)
+
+    # 4) REST-Fetzen (<2s) zwischen gleichen Übungen entfernen (Sets zusammenziehen)
+    j = 1
+    while j+1 < len(out):
+        prev, cur, nxt = out[j-1], out[j], out[j+1]
+        if (cur["class"] == "REST" and cur["duration_s"] < 2.0 and
+            is_strength(prev["class"]) and is_strength(nxt["class"]) and
+            prev["class"] == nxt["class"]):
+            prev["t1"] = nxt["t1"]
+            prev["duration_s"] = float(prev["t1"] - prev["t0"])
+            prev["reps"] = int(prev.get("reps",0) + nxt.get("reps",0))
+            del out[j:j+2]
+            j = max(1, j-1)
+            continue
+        j += 1
+
+    # 5) „Singleton“-Sets (einmalig & zu kurz) zu REST kippen – hilft gegen frühe False Positives
+    from collections import defaultdict
+    MIN_TOTAL_PER_CLASS_S = {
+        # kurze einmalige Blitze dieser Klassen → eher Artefakt
+        "CABLE_FLY_CHEST": 35.0,
+        "BENCH_BB": 35.0,
+        "BENCH_DB": 35.0,
+    }
+    dur_by_class = defaultdict(float)
+    for s in out:
+        if s["class"] != "REST":
+            dur_by_class[s["class"]] += s["duration_s"]
+    singletons = {c for c, min_tot in MIN_TOTAL_PER_CLASS_S.items()
+                  if dur_by_class.get(c, 0.0) > 0.0 and dur_by_class[c] < min_tot}
+
+    if singletons:
+        tmp = []
+        for s in out:
+            if s["class"] in singletons:
+                s = dict(s)
+                s["class"] = "REST"; s["reps"] = 0
+            if tmp and tmp[-1]["class"] == "REST" and s["class"] == "REST":
+                tmp[-1]["t1"] = max(tmp[-1]["t1"], s["t1"])
+                tmp[-1]["duration_s"] = float(tmp[-1]["t1"] - tmp[-1]["t0"])
+            else:
+                tmp.append(s)
+        out = tmp
+
+    return out
 
 # ---------- Hauptprogramm ----------
 def main():
@@ -408,6 +623,15 @@ def main():
     ap.add_argument("--min_reps", type=int, default=4, help="Unterhalb nicht als Übung zählen.")
     ap.add_argument("--below_min_policy", choices=["rest", "keep", "drop"], default="rest",
                     help="Was tun bei <min_reps in Kraftsegmenten: 'rest' umlabeln, 'keep' belassen, 'drop' verwerfen.")
+    # Post-Filter Overrides (optional) – Basiswerte
+    ap.add_argument("--post_min_strength_sec", type=float, default=POST_DEFAULTS["min_strength_duration_s"])
+    ap.add_argument("--post_min_rest_between_sec", type=float, default=POST_DEFAULTS["min_rest_between_sets_s"])
+    ap.add_argument("--post_acf_peak_thr", type=float, default=POST_DEFAULTS["acf_peak_thr"])
+    ap.add_argument("--post_band_ratio_thr", type=float, default=POST_DEFAULTS["band_ratio_thr"])
+    ap.add_argument("--post_std_thr_g", type=float, default=POST_DEFAULTS["std_thr_g"])
+    ap.add_argument("--post_min_rep_density", type=float, default=POST_DEFAULTS["min_rep_density"])
+    ap.add_argument("--post_conf_thr", type=float, default=POST_DEFAULTS["conf_thr"])
+
     args = ap.parse_args()
 
     infile = Path(args.infile)
@@ -419,6 +643,7 @@ def main():
     fs   = float(M["meta"]["fs_hz"])
     winS = float(M["meta"]["win_s"])
     hopS = float(M["meta"]["hop_s"])
+    strength_classes = strength_classes_from(M)
 
     # 2) Workout laden
     rows = list(read_jsonl(str(infile)))
@@ -456,15 +681,12 @@ def main():
         segments = merge_short_segments(segments, min_len_s=float(args.merge_min_s), prefer="neighbor")
 
     # 6) Rep-Counting
-    strength_classes = strength_classes_from(M)
     results = []
-
     t  = df["t"].to_numpy(float)
     ax = df["ax"].to_numpy(float)
     ay = df["ay"].to_numpy(float)
     az = df["az"].to_numpy(float)
 
-    # für peaks-Mode: leichte Glättung der Z-Achse (Kompatibilität)
     smooth_k = max(1, int(round(args.smooth_sec * fs)))
     az_smooth = moving_average(az, smooth_k)
 
@@ -475,16 +697,12 @@ def main():
         reps = 0
         if seg_class in strength_classes and np.count_nonzero(mask) > 3:
             if args.rep_mode == "pair":
-                # --- adaptive Signalwahl + Periodenschätzung ---
                 sig = select_rep_signal(ax[mask], ay[mask], az[mask], fs)
-
-                # Klassen-basierte Offsets
                 k0, min0, max0 = rep_params_for_class(seg_class,
                                                       base_k=float(args.rep_k),
                                                       base_min=float(args.rep_min_s),
                                                       base_max=float(args.rep_max_s))
 
-                # ACF-basierte Anpassung der erlaubten Rep-Dauer
                 if args.acf_enable:
                     p = estimate_rep_period_acf(sig, fs,
                                                 min_s=float(args.acf_min_s),
@@ -498,20 +716,15 @@ def main():
                 else:
                     min_s, max_s = min0, max0
 
-                # Sicherheit: min<max
                 if min_s >= max_s:
-                    min_s = min0
-                    max_s = max0
+                    min_s = min0; max_s = max0
 
                 reps = count_reps_peak_trough(sig, fs, k=k0, min_rep_s=min_s, max_rep_s=max_s)
 
-                # Für sehr kleine Amplituden (z. B. Cable Fly) als zweite Chance Schwelle etwas senken
                 if reps == 0:
                     k_try = max(0.25, k0 - 0.1)
                     reps = count_reps_peak_trough(sig, fs, k=k_try, min_rep_s=min_s, max_rep_s=max_s)
-
             else:
-                # 'peaks'-Modus (mit Prominenz)
                 az_seg = az_smooth[mask]
                 reps = count_peaks(
                     az_seg, fs,
@@ -520,11 +733,9 @@ def main():
                     prominence=0.5 * mad(az_seg)
                 )
 
-        # Mindest-Reps-Politik
         out_class = seg_class
         if seg_class in strength_classes:
             if args.below_min_policy == "drop" and reps < int(args.min_reps):
-                # Segment komplett verwerfen
                 continue
             if args.below_min_policy == "rest" and reps < int(args.min_reps):
                 out_class = "REST"
@@ -535,11 +746,25 @@ def main():
             "t1": float(seg["t1"]),
             "duration_s": float(seg["t1"] - seg["t0"]),
             "class": out_class,
-            "reps": int(reps) if out_class not in {"REST", "PAUSE", "WALKING", "RUNNING"} else 0
+            "reps": int(reps) if out_class not in {"REST", "PAUSE", "WALKING", "RUNNING"} else 0,
+            "i0": int(seg["i0"]),
+            "i1": int(seg["i1"]),
         }
         results.append(seg_out)
 
-    # 7) Ausgabe
+    # 7) Post-Filter anwenden (mit evtl. CLI-Overrides auf Basis-Defaults)
+    POST_DEFAULTS.update(dict(
+        min_strength_duration_s = float(args.post_min_strength_sec),
+        min_rest_between_sets_s = float(args.post_min_rest_between_sec),
+        acf_peak_thr            = float(args.post_acf_peak_thr),
+        band_ratio_thr          = float(args.post_band_ratio_thr),
+        std_thr_g               = float(args.post_std_thr_g),
+        min_rep_density         = float(args.post_min_rep_density),
+        conf_thr                = float(args.post_conf_thr),
+    ))
+    results = apply_post_filters(df, results, probs_s, classes, fs, strength_classes, cfg=POST_DEFAULTS)
+
+    # 8) Ausgabe
     print("\nVorhersage-Segmente:")
     for s in results:
         dur = s["duration_s"]
@@ -552,7 +777,7 @@ def main():
             line += f"  | reps: {s['reps']}"
         print(line)
 
-    # 8) JSON-Export
+    # 9) JSON-Export
     out_json = infile.with_suffix(".pred.json")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump({
