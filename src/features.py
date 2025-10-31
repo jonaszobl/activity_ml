@@ -11,7 +11,7 @@ from typing import Tuple, List
 import numpy as np
 import pandas as pd
 
-# ---------- leichte Helfer ----------
+# ---------- Helfer ----------
 def moving_average(x: np.ndarray, k: int) -> np.ndarray:
     # gleitender mittelwert… k = fenstergröße
     # k<=1 -> nix glätten, aber als float zurückgeben
@@ -129,7 +129,7 @@ def acf_primary_period(x: np.ndarray, fs: float,
     return float(lag/fs), float(ac[lag])  # periode in s + peak-höhe
 
 def robust_stats(x: np.ndarray) -> dict:
-    # robuste kenngrößen (median, mad, quantile, iqr, peakt-to-peak)
+    # robuste kenngrößen (median, mad, quantile, iqr, peak-to-peak)
     if len(x) == 0:
         return dict(med=0, mad=0, p10=0, p25=0, p75=0, p90=0, iqr=0, ptp=0)
     med = float(np.median(x))
@@ -233,8 +233,9 @@ def window_features(df_win: pd.DataFrame, fs: float) -> Tuple[np.ndarray, List[s
     feats += [float(np.mean(pitch)), float(np.std(pitch)), float(np.mean(roll)), float(np.std(roll))]
     names += ["tilt_pitch_mean", "tilt_pitch_std", "tilt_roll_mean", "tilt_roll_std"]
 
-        # Baro (immer verwendet, NaNs einzeln ignorieren)
+    # Baro (immer verwendet, NaNs einzeln ignorieren)
     if "baro" not in df_win.columns:
+        # wurde hinzugefügt weil baro-basierte höhenänderung fester Bestandteil der Features ist
         raise KeyError("Fehler: Spalte 'baro' fehlt – baro ist jetzt Pflicht!")
 
     # alle NaNs entfernen (aber nicht ganze Spalte verwerfen)
@@ -243,34 +244,32 @@ def window_features(df_win: pd.DataFrame, fs: float) -> Tuple[np.ndarray, List[s
         # falls trotzdem alles NaN, dann auf 0 setzen (selten)
         baro = np.zeros_like(baro)
 
-    # Kenngrößen berechnen – keine 0-Fallbacks mehr
-    baro_mean = float(np.nanmean(baro))
-    baro_var  = float(np.nanvar(baro))
-    baro_ac1  = autocorr_lag(np.nan_to_num(baro, nan=0.0), 1)
-    # grobe Steigung (delta h / delta t)
-    dhdt = float((baro[-1] - baro[0]) * fs / max(1, len(baro)))
-
+    # --- Baro (optional, wie früher) ---
+    # hinweis: block belassen für rückwärtskompatible daten; oben bereits Pflicht -> hier eher Doppelsicherung
+    if "baro" in df_win.columns and df_win["baro"].notna().any():
+        baro = df_win["baro"].ffill().bfill().to_numpy(float)
+        baro_mean = float(baro.mean()); baro_var = float(baro.var()); baro_ac1 = autocorr_lag(baro, 1)
+        dhdt = float((baro[-1] - baro[0]) * fs / max(1, len(baro)))  # höhenänderung pro sek (baro-only) -> wurde hinzugefügt
+    else:
+        baro_mean = baro_var = baro_ac1 = dhdt = 0.0
     feats += [baro_mean, baro_var, baro_ac1, dhdt]
     names += ["baro_mean", "baro_var", "baro_ac1", "baro_dhdt"]
 
-    # NOT IN USE!
-    #------------------------------------------------------------------------------
-    # Steps-Delta (optional) … wie viele schritte in diesem fenster hinzu kamen
-    #if "steps" in df_win.columns and df_win["steps"].notna().any():
-        #steps = df_win["steps"].ffill().bfill().to_numpy(float)
-        #steps_delta = float(steps[-1] - steps[0])
-    #else:
-        #steps_delta = 0.0
-    #feats += [steps_delta]; names += ["steps_delta"]
+    # --- Steps-Delta (optional) ---  # (WIEDER AKTIV!)
+    if "steps" in df_win.columns and df_win["steps"].notna().any():
+        steps = df_win["steps"].ffill().bfill().to_numpy(float)
+        steps_delta = float(steps[-1] - steps[0])  # kann noch verfeinert werden → normieren auf fensterdauer?
+    else:
+        steps_delta = 0.0
+    feats += [steps_delta]; names += ["steps_delta"]
 
-    # Herzrate mean/std (optional)
-    #if "hr" in df_win.columns and df_win["hr"].notna().any():
-        #hr = df_win["hr"].dropna().astype(float).to_numpy()
-        #feats += [float(hr.mean()), float(hr.std())]
-    #else:
-        #feats += [0.0, 0.0]
-    #names += ["hr_mean", "hr_std"]
-    #------------------------------------------------------------------------------
+    # --- Herzrate mean/std (optional) ---  # (WIEDER AKTIV!)
+    if "hr" in df_win.columns and df_win["hr"].notna().any():
+        hr = df_win["hr"].dropna().astype(float).to_numpy()
+        feats += [float(hr.mean()), float(hr.std())]
+    else:
+        feats += [0.0, 0.0]
+    names += ["hr_mean", "hr_std"]
 
     # final: numpy vektor + zugehörige namenliste zurück
     return np.asarray(feats, dtype=np.float32), names
@@ -310,7 +309,7 @@ def build_windows(df: pd.DataFrame, fs: float, win_s: float, hop_s: float):
         dfw = df.iloc[i:i+win]         # aktuelles fenster
         feats, nms = window_features(dfw, fs)
         if names is None:
-            names = nms                
+            names = nms                # wurde hinzugefügt um erste namensliste festzunageln
 
         # Mehrheitslabel im fenster (falls labels überhaupt da)
         lab = None
@@ -318,7 +317,7 @@ def build_windows(df: pd.DataFrame, fs: float, win_s: float, hop_s: float):
             labs = dfw["label"].dropna().astype(str).str.upper().values
             if len(labs):
                 vals, cnts = np.unique(labs, return_counts=True)
-                lab = str(vals[np.argmax(cnts)])
+                lab = str(vals[np.argmax(cnts)])  # simpel: hartes mehrheitsvotum
 
         X.append(feats); y.append(lab); t0s.append(float(dfw["t"].iloc[0]))
         i += hop                        # zum nächsten hop springen
