@@ -196,7 +196,7 @@ def _run_predict(df: pd.DataFrame, M: dict,
             "i1": int(seg["i1"]),
         })
 
-    # -------- NEU: Post-Filter anwenden (wie lokal im Script) --------
+    # -------- NEU: Post-Filter anwenden (see lokal im Script) --------
     # Basis-Defaults mit API-Overrides mischen:
     pf_cfg = dict(POST_DEFAULTS)
     pf_cfg.update(dict(
