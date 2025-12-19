@@ -1,4 +1,3 @@
-# src/predict_workout.py
 import json
 import sys
 import argparse
@@ -7,199 +6,29 @@ import numpy as np
 import pandas as pd
 
 from .utils_jsonl import read_jsonl
-from .features import build_windows, rfft_band_features  
-from .repsHandler import count_reps_for_segment          # <- Add-on: verfeinert NUR die Reps (kein Einfluss auf Labels)
-# eigene rep Zählung für jede Übung durch Stratagy Pattern -> eigener Handler für jedes Übung
+from .features import build_windows
+from .model import load_model, predict_features
 
-# ---------- Mathe / Utils ----------
-def softmax(z):
-    # standard-softmax; numerisch stabil via max-shift
-    z = np.asarray(z, float)
-    m = np.max(z)
-    e = np.exp(z - m)
-    s = np.sum(e)
-    return e / s if s > 0 else np.ones_like(e) / len(e)
+from .segmentation.reps import (
+    moving_average,
+    count_peaks,
+    count_reps_peak_trough,
+    estimate_rep_period_acf,
+    select_rep_signal,
+    rep_params_for_class,
+    mad,
+)
 
-def moving_average(x: np.ndarray, k: int) -> np.ndarray:
-    # simpler gleitender Mittelwert; für Rohachsen & Probs
-    if k <= 1:
-        return x.astype(float, copy=True)
-    k = int(k)
-    x = x.astype(float)
-    c = np.cumsum(np.insert(x, 0, 0.0))
-    y = (c[k:] - c[:-k]) / k
-    pad = np.full(k - 1, y[0] if len(y) else 0.0, dtype=float)
-    return np.concatenate([pad, y]).astype(float)
+from .segmentation.postprocessing import (
+    smooth_probs_over_time,
+    debounce_labels,
+    segment_from_window_preds,
+    merge_short_segments,
+    strength_classes_from,
+    apply_post_filters,
+    POST_DEFAULTS,
+)
 
-def median(a):
-    # kleine robuste Helfer... nicht übertreiben
-    a = np.asarray(a, float)
-    if len(a) == 0:
-        return 0.0
-    return float(np.median(a))
-
-def mad(a):
-    # MAD statt STD -> robuster gg. Ausreißer
-    m = median(a)
-    return float(np.median(np.abs(np.asarray(a, float) - m)))
-
-# ---------- Peak-basierte Zählung (optional) ----------
-def count_peaks(signal: np.ndarray, fs: float,
-                min_separation_s: float = 0.4,
-                thresh_mode: str = "median_mad",
-                prominence: float = 0.0) -> int:
-    # alt/legacy; bleibt drin als fallback
-    if len(signal) < 3:
-        return 0
-    if thresh_mode == "median_mad":
-        th = median(signal) + 0.5 * mad(signal)  # vorher 0.3 -> höher, um Rauschen zu ignorieren
-    else:
-        th = median(signal)
-
-    min_dist = max(1, int(round(min_separation_s * fs)))
-    last = -min_dist
-    peaks = 0
-    for i in range(1, len(signal) - 1):
-        if i - last < min_dist:
-            continue
-        s0, s1, s2 = signal[i - 1], signal[i], signal[i + 1]
-        if s1 > th and s1 > s0 and s1 > s2:
-            if prominence > 0.0:
-                left = max(0, i - min_dist)
-                right = min(len(signal) - 1, i + min_dist)
-                base = max(median(signal[left:i]), median(signal[i:right + 1]))
-                if (s1 - base) < prominence:
-                    continue
-            peaks += 1
-            last = i
-    return peaks
-
-# ---------- Pair-Zählung (empfohlen) ----------
-def count_reps_peak_trough(signal: np.ndarray, fs: float,
-                           k: float = 0.6,
-                           min_rep_s: float = 0.6,
-                           max_rep_s: float = 4.0) -> int:
-    # einfache Peak↔Trough-Paarlogik; robust genug für Basiszählung
-    n = len(signal)
-    if n < 3:
-        return 0
-    med = median(signal)
-    m = mad(signal)
-    if m < 1e-6:
-        m = np.std(signal) * 0.8  # fallback wenn MAD zu klein
-    if m < 1e-6:
-        return 0
-
-    up = med + k * m
-    down = med - k * m  # k kann noch verfeinert werden…
-
-    last_ext_t = None
-    last_ext_type = None  # "peak" | "trough"
-    reps = 0
-
-    for i in range(1, n - 1):
-        s0, s1, s2 = signal[i - 1], signal[i], signal[i + 1]
-        t = i / fs
-        if s1 > up and s1 > s0 and s1 > s2:
-            if last_ext_type == "trough":
-                dt = t - last_ext_t
-                if min_rep_s <= dt <= max_rep_s:
-                    reps += 1
-            last_ext_t = t
-            last_ext_type = "peak"
-        elif s1 < down and s1 < s0 and s1 < s2:
-            if last_ext_type == "peak":
-                dt = t - last_ext_t
-                if min_rep_s <= dt <= max_rep_s:
-                    reps += 1
-            last_ext_t = t
-            last_ext_type = "trough"
-    return reps
-
-# ---------- Signalwahl & Periodenschätzung ----------
-def highpass_ma(x: np.ndarray, fs: float, cutoff_s: float = 0.7) -> np.ndarray:
-    # HP via MA-Subtraktion; simpel & schnell
-    k = max(1, int(round(cutoff_s * fs)))
-    trend = moving_average(x, k)
-    y = x.astype(float) - trend
-    return y
-
-def _acf_primary_peak(signal: np.ndarray, fs: float,
-                      min_s: float, max_s: float):
-    # ACF-Peak grob suchen -> liefert p und peak-höhe
-    n = len(signal)
-    if n < int(fs * min_s) + 3:
-        return 0.0, 0.0
-    x = signal - np.mean(signal)
-    std = np.std(x)
-    if not np.isfinite(std) or std < 1e-8:
-        return 0.0, 0.0
-
-    ac = np.correlate(x, x, mode="full")[n-1:]
-    ac /= (ac[0] + 1e-12)
-
-    min_lag = max(1, int(round(min_s * fs)))
-    max_lag = min(n - 2, int(round(max_s * fs)))
-    if max_lag <= min_lag:
-        return 0.0, 0.0
-
-    lag = None
-    for i in range(min_lag + 1, max_lag - 1):
-        if ac[i] > ac[i - 1] and ac[i] > ac[i + 1]:
-            lag = i
-            break
-    if lag is None:
-        lag = min_lag + int(np.argmax(ac[min_lag:max_lag]))
-    return (lag / fs), float(ac[lag])
-
-def estimate_rep_period_acf(signal: np.ndarray, fs: float,
-                            min_s: float = 0.4, max_s: float = 3.0) -> float:
-    # hilfsfunktion um p zu schätzen; schlank gehalten
-    p, _ = _acf_primary_peak(signal, fs, min_s, max_s)
-    return p
-
-def select_rep_signal(ax: np.ndarray, ay: np.ndarray, az: np.ndarray, fs: float) -> np.ndarray:
-    # Wahl der „besten“ Achse -> ACF-Score, Fallback STD
-    xhp = highpass_ma(ax, fs, 0.7)
-    yhp = highpass_ma(ay, fs, 0.7)
-    zhp = highpass_ma(az, fs, 0.7)
-    mag = np.sqrt(ax**2 + ay**2 + az**2)
-    maghp = highpass_ma(mag, fs, 0.7)
-
-    k = max(1, int(round(0.16 * fs)))  # kurzer MA -> glättet leicht
-    xs = moving_average(xhp, k)
-    ys = moving_average(yhp, k)
-    zs = moving_average(zhp, k)
-    ms = moving_average(maghp, k)
-
-    cands = [xs, ys, zs, ms]
-    scores = []
-    for sig in cands:
-        _, peak = _acf_primary_peak(sig, fs, 0.4, 3.0)
-        scores.append(peak if np.isfinite(peak) else 0.0)
-    best = int(np.argmax(scores))
-    if scores[best] < 0.05:  # vorher 0.03 -> anheben, um Zufall zu vermeiden
-        stds = np.array([np.std(c) for c in cands])
-        best = int(np.argmax(stds))
-    return cands[best]
-
-# ---------- Modell / IO ----------
-def load_model(path="artifacts/model.json"):
-    # kleiner loader; artifacts aus training
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def predict_features(X: np.ndarray, M: dict):
-    # linearer Kopf + softmax; gleiche Normalisierung wie Training
-    mean = np.asarray(M["scaler_mean"], float)
-    scale = np.asarray(M["scaler_scale"], float)
-    Xn = (X - mean) / scale
-    W = np.asarray(M["W"], float)     # [C,F]
-    b = np.asarray(M["b"], float)     # [C]
-    logits = Xn @ W.T + b             # [N,C]
-    probs = np.apply_along_axis(softmax, 1, logits)
-    cls_idx = np.argmax(probs, axis=1)
-    return cls_idx, probs
 
 # ---------- DataFrame Helpers ----------
 def ensure_time_column_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -217,448 +46,14 @@ def ensure_time_column_df(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in need if c not in df.columns]
     assert not missing, f"Spalten fehlen: {missing}"
     df = df.dropna(subset=["t"])
+
+    # hr/steps in den Rohdaten ignorieren, falls vorhanden
+    for col in ("hr", "steps"):
+        if col in df.columns:
+            df = df.drop(columns=[col])
+
     return df
 
-# ---------- Post-Processing für stabilere Segmente ----------
-def smooth_probs_over_time(probs: np.ndarray, k: int = 5) -> np.ndarray:
-    # leichte Tempoglatte der Probs; verhindert Flackern
-    if k <= 1:
-        return probs
-    N, C = probs.shape
-    out = np.empty_like(probs, dtype=float)
-    for c in range(C):
-        x = probs[:, c]
-        csum = np.cumsum(np.insert(x, 0, 0.0))
-        y = (csum[k:] - csum[:-k]) / k
-        pad = np.full(k - 1, y[0] if len(y) else 0.0)
-        out[:, c] = np.concatenate([pad, y])
-    s = out.sum(axis=1, keepdims=True)
-    s[s == 0] = 1.0
-    return out / s  # normieren
-
-def debounce_labels(cls_idx: np.ndarray, min_run: int = 3) -> np.ndarray:
-    # entprellt schnelle Wechsel; sehr simpler Automat
-    cls_idx = cls_idx.astype(int)
-    out = np.empty_like(cls_idx)
-    current = cls_idx[0]
-    run = 1
-    out[0] = current
-    for i in range(1, len(cls_idx)):
-        if cls_idx[i] == current:
-            out[i] = current
-            run = 1
-        else:
-            run += 1
-            if run >= min_run:
-                current = cls_idx[i]
-                out[i] = current
-                run = 1
-            else:
-                out[i] = current
-    return out
-
-def segment_from_window_preds(t0s, cls_idx, classes, win_s):
-    # fensterklassen → zusammenhängende Segmente
-    segments = []
-    i = 0
-    while i < len(cls_idx):
-        k = int(cls_idx[i])
-        j = i + 1
-        while j < len(cls_idx) and int(cls_idx[j]) == k:
-            j += 1
-        t0 = float(t0s[i])
-        t1 = float(t0s[j - 1]) + float(win_s)
-        segments.append({
-            "t0": t0,
-            "t1": t1,
-            "duration_s": float(t1 - t0),
-            "class": str(classes[k]),
-            "i0": int(i),
-            "i1": int(j)
-        })
-        i = j
-    return segments
-
-def merge_short_segments(segments, min_len_s: float, prefer: str = "neighbor"):
-    # zu kurze Segmente in Nachbarn mergen; reduziert Fetzen
-    if not segments:
-        return segments
-    segs = [dict(s) for s in segments]
-    i = 0
-    while i < len(segs):
-        s = segs[i]
-        dur = float(s["t1"] - s["t0"])
-        if dur < min_len_s and len(segs) > 1:
-            left = segs[i - 1] if i - 1 >= 0 else None
-            right = segs[i + 1] if i + 1 < len(segs) else None
-            target = None
-            if prefer == "prev" and left:
-                target = ("prev", left)
-            elif prefer == "next" and right:
-                target = ("next", right)
-            else:
-                if left and right:
-                    len_left = left["t1"] - left["t0"]
-                    len_right = right["t1"] - right["t0"]
-                    target = ("prev", left) if len_left <= len_right else ("next", right)
-                elif left:
-                    target = ("prev", left)
-                elif right:
-                    target = ("next", right)
-
-            if target:
-                side, _ = target
-                if side == "prev" and left:
-                    left["t1"] = s["t1"]; left["duration_s"] = float(left["t1"] - left["t0"])
-                    del segs[i]; i = max(i - 1, 0); continue
-                if side == "next" and right:
-                    right["t0"] = s["t0"]; right["duration_s"] = float(right["t1"] - right["t0"])
-                    del segs[i]; continue
-        i += 1
-    return segs
-
-def strength_classes_from(M):
-    # Filter gegen Alltagsklassen -> nur echte Kraftübungen
-    exclude = {"REST", "PAUSE", "WALKING", "RUNNING"}
-    return {c for c in M["classes"] if str(c).upper() not in exclude}
-
-def seconds_to_hms(sec: float) -> str:
-    # display helper; bleibt simple
-    sec = int(round(sec))
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    if h > 0:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:d}:{s:02d}"
-
-# ---------- Klassen-Heuristiken (für Reps) ----------
-def class_name_key(name: str) -> str:
-    # mapping für rep-params; minimal gehalten
-    u = str(name).upper()
-    if "TRICEPS" in u and "PULL" in u:
-        return "TRICEPS_PULLDOWN"
-    if "FLY" in u or ("CABLE" in u and "CHEST" in u):
-        return "CABLE_FLY"
-    if "BENCH" in u or "BANKDR" in u:
-        return "BENCH_PRESS"
-    if "SHOULDER" in u and "PRESS" in u:
-        return "SHOULDER_PRESS"
-    return "DEFAULT"
-
-def rep_params_for_class(name: str, base_k: float, base_min: float, base_max: float):
-    # leichte Klassentunings; konservativ
-    key = class_name_key(name)
-    if key == "CABLE_FLY":
-        k = max(0.30, base_k - 0.20)          # vorher base_k -> abgesenkt wegen sanfter Bewegung
-        return k, base_min, max(base_max, base_min + 2.6)
-    if key == "TRICEPS_PULLDOWN":
-        k = min(1.0, base_k + 0.10)           # wurde angehoben da sonst Unterzählung
-        return k, max(base_min, 0.70), base_max
-    if key == "SHOULDER_PRESS":
-        return base_k, base_min, base_max
-    if key == "BENCH_PRESS":
-        return base_k, base_min, base_max
-    return base_k, base_min, base_max  # fallback
-
-# ---------- Post-Filter Defaults (Basis) ----------
-POST_DEFAULTS = dict(
-    # Basis-Werte; dienen als Untergrenze bevor Klassentuning greift
-    min_strength_duration_s = 8.0,   # <8 s: sehr wahrscheinlich kein echter Satz
-    min_rest_between_sets_s = 10.0,  # Pflicht-Ruhe zwischen Sets
-    acf_peak_thr            = 0.18,  # Periodizität muss spürbar sein
-    band_ratio_thr          = 0.35,  # Anteil 0.3–3 Hz hoch genug
-    std_thr_g               = 0.05,  # Mindest-Amplitude (g) nach Highpass+Smooth
-    min_rep_density         = 0.25,  # reps/duration_s
-    conf_thr                = 0.50   # mittlere Segment-Confidence
-)
-# vorher strengere Schwellen getestet -> zu viele False REST → gnädiger gesetzt
-
-# Rudern add-on, da rep_density rauswirft...
-RUDERN_DENSITY_ALPHA = 0.70   # 70% der erwarteten Dichte reicht fürs Gate
-RUDERN_ACF_TRUST     = 0.12   # ab dieser ACF-Höhe traut die Logik der Periode
-
-# ============================================
-# Klassenspezifische Schwellen (Hyperfunktion)
-# – kurze Stichworte aus Erfahrungswerten
-# ============================================
-CLASS_THRESH = {
-
-    # --- Brust / Fly ---
-    "CABLE_FLY_CHEST": dict(
-        acf_peak_thr=0.13,      # weiche Bewegung; Peak eher klein
-        band_ratio_thr=0.25,    # wenig 0.3–3Hz-Energie
-        std_thr_g=0.030,        # kaum G-Ausschlag am HG
-        min_rep_density=0.17,   # ~1 rep in ~6s ok
-        conf_thr=0.40,          # Modell teils unsicher → gnädiger
-        min_strength_duration_s=10.0
-    ),
-
-    # --- Bankdrücken Langhantel ---
-    "BENCH_BB": dict(
-        acf_peak_thr=0.16,      # klarer Rhythmus, Auflage dämpft
-        band_ratio_thr=0.32,
-        std_thr_g=0.045,
-        min_rep_density=0.22,   # ~1 rep / 4.5s
-        conf_thr=0.45,
-        min_strength_duration_s=8.0
-    ),
-
-    # --- Bankdrücken Kurzhanteln ---
-    "BENCH_DB": dict(
-        acf_peak_thr=0.15,      # ungleichmäßiger → etwas kleiner
-        band_ratio_thr=0.28,
-        std_thr_g=0.040,
-        min_rep_density=0.20,
-        conf_thr=0.40,
-        min_strength_duration_s=9.0
-    ),
-
-    # --- Trizeps-Kabelzug ---
-    "TRICEPS_PULLDOWN": dict(
-        acf_peak_thr=0.15,      # schnell/gleichmäßig, kleine Amplitude
-        band_ratio_thr=0.30,
-        std_thr_g=0.038,
-        min_rep_density=0.23,   # ~1 rep / 4.3s
-        conf_thr=0.45,
-        min_strength_duration_s=8.0
-    ),
-
-    # --- Schulterdrücken ---
-    "SHOULDER_PRESS": dict(
-        acf_peak_thr=0.17,      # Totpunkt oben -> Peak kleiner
-        band_ratio_thr=0.33,
-        std_thr_g=0.042,
-        min_rep_density=0.22,
-        conf_thr=0.45,
-        min_strength_duration_s=9.0
-    ),
-
-    # --- Seitheben Kabel ---
-    "LATERAL_RAISE_CABLE": dict(
-        acf_peak_thr=0.12,      # kleine Range → schwacher Peak
-        band_ratio_thr=0.24,
-        std_thr_g=0.028,
-        min_rep_density=0.18,
-        conf_thr=0.35,
-        min_strength_duration_s=9.0
-    ),
-
-    # --- Bizeps einarmig KH ---
-    "BIZEPS_CURL_H": dict(
-        acf_peak_thr=0.16,
-        band_ratio_thr=0.30,
-        std_thr_g=0.040,
-        min_rep_density=0.22,
-        conf_thr=0.45,
-        min_strength_duration_s=8.0
-    ),
-
-    # --- Bizeps beidarmig ---
-    "BIZEPS_CURL": dict(
-        acf_peak_thr=0.15,
-        band_ratio_thr=0.28,
-        std_thr_g=0.038,
-        min_rep_density=0.21,
-        conf_thr=0.45,
-        min_strength_duration_s=8.0
-    ),
-
-    # --- Rudern (Kabel/Maschine) ---
-    "RUDERN": dict(
-        acf_peak_thr=0.05,      # träge Bewegung → Peak flach
-        band_ratio_thr=0.26,
-        std_thr_g=0.040,
-        min_rep_density=0.21,   # 1 rep ~6–7s ok
-        conf_thr=0.42,          # toleranter
-        min_strength_duration_s=10.0
-    ),
-}
-
-def thresholds_for_class(name: str, base: dict):
-    """
-    Mischt Basis-Defaults mit Klassentunings aus CLASS_THRESH.
-    -> erlaubt Feintuning je Übung ohne Re-Training
-    """
-    u = str(name).upper()
-    overrides = CLASS_THRESH.get(u, {})
-    cfg = dict(base)
-    cfg.update({k: overrides[k] for k in overrides})
-    return cfg
-
-# ---------- Guards (pro Segment) ----------
-def _segment_signal_guards(ax, ay, az, fs):
-    # einfache Messgrößen je Segment; Gate für Postfilter
-    sig = select_rep_signal(ax, ay, az, fs)
-    std_best = float(np.std(sig)) if len(sig) else 0.0
-    _, acf_peak = _acf_primary_peak(sig, fs, 0.4, 3.0)
-    _, band_ratio, _, _, _ = rfft_band_features(sig, fs, 0.3, 3.0)
-    return std_best, float(acf_peak), float(band_ratio)
-
-# ---------- Zentrales Postprocessing ----------
-def apply_post_filters(df, segments, probs_s, classes, fs, strength_classes, cfg=POST_DEFAULTS):
-    # setzt harte Regeln + Heuristiken nach Klassifizierung
-    if not segments:
-        return segments
-
-    class_to_idx = {c: i for i, c in enumerate(classes)}
-    sc_upper = {s.upper() for s in strength_classes}
-
-    def is_strength(c):
-        return str(c).upper() in sc_upper
-
-    def mean_conf_for_segment(seg):
-        # mittlere Modell-Confidence über Fenster
-        if "i0" in seg and "i1" in seg and probs_s is not None:
-            ci = class_to_idx.get(seg["class"], None)
-            if ci is None:
-                return 0.0
-            i0, i1 = int(seg["i0"]), int(seg["i1"])
-            i1 = max(i0+1, i1)
-            p = probs_s[i0:i1, ci]
-            if p.size > 0:
-                return float(np.mean(p))
-        return 0.0
-
-    t = df["t"].to_numpy(float)
-    ax = df["ax"].to_numpy(float)
-    ay = df["ay"].to_numpy(float)
-    az = df["az"].to_numpy(float)
-
-    # 1) Harte Regeln & Signal-Guards
-    for s in segments:
-        dur = float(s["duration_s"])
-        # — dynamische Schwellen für diese Klasse —
-        cfg_c = thresholds_for_class(s["class"], cfg)
-
-        # a) Übung ohne Reps -> REST
-        if is_strength(s["class"]) and int(s.get("reps", 0)) == 0:
-            s["class"] = "REST"; s["reps"] = 0; continue
-        # b) Mindestdauer
-        if is_strength(s["class"]) and dur < cfg_c["min_strength_duration_s"]:
-            s["class"] = "REST"; s["reps"] = 0; continue
-        # c) Guards
-        if is_strength(s["class"]):
-            mask = (t >= s["t0"]) & (t <= s["t1"])
-            if np.count_nonzero(mask) >= int(0.8*fs):
-                sig = select_rep_signal(ax[mask], ay[mask], az[mask], fs)
-                std_best, acf_peak, band_ratio = _segment_signal_guards(ax[mask], ay[mask], az[mask], fs)
-                # Basis: gemessene Dichte aus gezählten Reps
-                rep_density = (s.get("reps", 0) / max(1e-9, dur))
-
-                # Nur für RUDERN: ACF-basierte Proxy-Dichte als „Rettungsleine“
-                # wurde hinzugefügt weil Unterzählung bei flacher Amplitude
-                if str(s["class"]).upper() == "RUDERN":
-                    p_est = estimate_rep_period_acf(sig, fs, min_s=0.6, max_s=3.5)
-                    if np.isfinite(p_est) and p_est > 0 and acf_peak >= RUDERN_ACF_TRUST:
-                        exp_density = 1.0 / p_est
-                        proxy_density = RUDERN_DENSITY_ALPHA * exp_density
-                        rep_density = max(rep_density, proxy_density)
-
-                # Debugg weil rudern rausgefiltert wurde
-                #-----------------------
-                mc = mean_conf_for_segment(s)  # aufzeichnung für tuning
-                if str(s["class"]).upper() == "RUDERN":
-                    t0 = s.get("t0", 0.0); t1 = s.get("t1", 0.0)
-                    def fmt(sec):
-                        sec = int(round(sec)); m = sec // 60; ss = sec % 60
-                        return f"{m:02d}:{ss:02d}"
-                    print(
-                        f"[DBG RUDERN] {fmt(t0)}→{fmt(t1)} ({dur:5.1f}s) | "
-                        f"reps={s.get('reps',0):2d} dens={rep_density:.3f} "
-                        f"std={std_best:.3f} acf={acf_peak:.3f} band={band_ratio:.3f} "
-                        f"mc={mc:.3f}",
-                        file=sys.stderr
-                    )
-                #-----------------------
-                if (std_best < cfg_c["std_thr_g"] or 
-                    acf_peak < cfg_c["acf_peak_thr"] or 
-                    band_ratio < cfg_c["band_ratio_thr"] or
-                    rep_density < cfg_c["min_rep_density"]):
-                    s["class"] = "REST"; s["reps"] = 0; continue
-            else:
-                s["class"] = "REST"; s["reps"] = 0; continue
-        # d) Confidence (falls vorhanden)
-        if is_strength(s["class"]):
-            mc = mean_conf_for_segment(s)
-            if mc < cfg_c["conf_thr"]:
-                s["class"] = "REST"; s["reps"] = 0; continue
-
-    # 2) Pflicht-Rest zwischen zwei Kraft-Segmenten
-    i = 1
-    while i < len(segments):
-        a, b = segments[i-1], segments[i]
-        if is_strength(a["class"]) and is_strength(b["class"]):
-            gap = float(b["t0"] - a["t1"])
-            if gap < cfg["min_rest_between_sets_s"]:
-                dens_a = a.get("reps",0) / max(1e-9, a["duration_s"])
-                dens_b = b.get("reps",0) / max(1e-9, b["duration_s"])
-
-                # Bevorzugt höheren Dichte-Satz; bei ~gleich -> längerer gewinnt
-                if dens_a > dens_b + 0.02:
-                    turn_rest = b
-                elif dens_b > dens_a + 0.02:
-                    turn_rest = a
-                else:
-                    turn_rest = a if a["duration_s"] < b["duration_s"] else b
-                turn_rest["class"] = "REST"
-                turn_rest["reps"]  = 0
-                i = max(1, i-1)
-                continue
-        i += 1
-
-    # 3) REST-Glättung & Merges
-    out = []
-    for s in segments:
-        if out and out[-1]["class"] == "REST" and s["class"] == "REST":
-            out[-1]["t1"] = max(out[-1]["t1"], s["t1"])
-            out[-1]["duration_s"] = float(out[-1]["t1"] - out[-1]["t0"])
-        else:
-            out.append(s)
-
-    # 4) REST-Fetzen (<2s) zwischen gleichen Übungen entfernen
-    j = 1
-    while j+1 < len(out):
-        prev, cur, nxt = out[j-1], out[j], out[j+1]
-        if (cur["class"] == "REST" and cur["duration_s"] < 2.0 and
-            is_strength(prev["class"]) and is_strength(nxt["class"]) and
-            prev["class"] == nxt["class"]):
-            prev["t1"] = nxt["t1"]
-            prev["duration_s"] = float(prev["t1"] - prev["t0"])
-            prev["reps"] = int(prev.get("reps",0) + nxt.get("reps",0))
-            del out[j:j+2]
-            j = max(1, j-1)
-            continue
-        j += 1
-
-    # 5) „Singleton“-Sets (kurz & einmalig) zu REST kippen
-    from collections import defaultdict
-    MIN_TOTAL_PER_CLASS_S = {
-        "CABLE_FLY_CHEST": 35.0,
-        "BENCH_BB": 35.0,
-        "BENCH_DB": 35.0,
-    }
-    dur_by_class = defaultdict(float)
-    for s in out:
-        if s["class"] != "REST":
-            dur_by_class[s["class"]] += s["duration_s"]
-    singletons = {c for c, min_tot in MIN_TOTAL_PER_CLASS_S.items()
-                  if dur_by_class.get(c, 0.0) > 0.0 and dur_by_class[c] < min_tot}
-
-    if singletons:
-        tmp = []
-        for s in out:
-            if s["class"] in singletons:
-                s = dict(s)
-                s["class"] = "REST"; s["reps"] = 0
-            if tmp and tmp[-1]["class"] == "REST" and s["class"] == "REST":
-                tmp[-1]["t1"] = max(tmp[-1]["t1"], s["t1"])
-                tmp[-1]["duration_s"] = float(tmp[-1]["t1"] - tmp[-1]["t0"])
-            else:
-                tmp.append(s)
-        out = tmp
-
-    return out
 
 # ---------- Hauptprogramm ----------
 def main():
@@ -781,7 +176,8 @@ def main():
                     min_s, max_s = min0, max0
 
                 if min_s >= max_s:
-                    min_s = min0; max_s = max0  # safety gegen verdrehte parameter
+                    min_s = min0
+                    max_s = max0  # safety gegen verdrehte parameter
 
                 base_reps = count_reps_peak_trough(sig, fs, k=k0, min_rep_s=min_s, max_rep_s=max_s)
 
@@ -809,6 +205,7 @@ def main():
             "t0": float(seg["t0"]),
             "t1": float(seg["t1"]),
             "duration_s": float(seg["t1"] - seg["t0"]),
+
             "class": out_class,
             "reps": int(base_reps) if out_class not in {"REST", "PAUSE", "WALKING", "RUNNING"} else 0,  # ALT/basis
             "i0": int(seg["i0"]),
@@ -826,64 +223,29 @@ def main():
         min_rep_density         = float(args.post_min_rep_density),
         conf_thr                = float(args.post_conf_thr),
     ))
+    
     results = apply_post_filters(df, results, probs_s, classes, fs, strength_classes, cfg=POST_DEFAULTS)
 
-    # 7b) Reps NACHTRÄGLICH verfeinern (Add-on) – keine Auswirkung auf Labels/Postfilter
-    #     -> nimmt die finalen Segmente und berechnet nur eine zusätzliche Zahl.
+    # 7b) Reps "verfeinern": Handler ist optional -> hier: reps_refined = Basiszählung
     for s in results:
-        if s["class"] in strength_classes and s.get("reps", 0) >= 0:
-            mask = (t >= s["t0"]) & (t <= s["t1"])
-            if np.count_nonzero(mask) > 3:
-                sig = select_rep_signal(ax[mask], ay[mask], az[mask], fs)
-
-                # gleiche Parametrisierung wie bei der Basiszählung (fairer Vergleich)
-                k0, min0, max0 = rep_params_for_class(
-                    s["class"],
-                    base_k=float(args.rep_k),
-                    base_min=float(args.rep_min_s),
-                    base_max=float(args.rep_max_s)
-                )
-
-                if args.acf_enable:
-                    p = estimate_rep_period_acf(sig, fs,
-                                                min_s=float(args.acf_min_s),
-                                                max_s=float(args.acf_max_s))
-                    if p > 0:
-                        lo_fac, hi_fac = float(args.acf_band[0]), float(args.acf_band[1])
-                        min_s = max(0.35, min(p * lo_fac, max0))
-                        max_s = max(min0, min(p * hi_fac, max0))
-                    else:
-                        min_s, max_s = min0, max0
-                else:
-                    min_s, max_s = min0, max0
-
-                if min_s >= max_s:
-                    min_s, max_s = min0, max0
-
-                # aufruf von count_reps_for_segment (Handler inkl. Gap-Repair)
-                s["reps_refined"] = int(count_reps_for_segment(
-                    sig=sig,
-                    fs=fs,
-                    segment_class=s["class"],
-                    k=k0,
-                    min_rep_s=min_s,
-                    max_rep_s=max_s,
-                ))
-
-            else:
-                s["reps_refined"] = int(s["reps"])
+        if s["class"] == "REST":
+            s["reps_refined"] = 0
         else:
-            s["reps_refined"] = 0 if s["class"] == "REST" else int(s.get("reps", 0))
+            s["reps_refined"] = int(s.get("reps", 0))
 
     # 8) Ausgabe
     print("\nVorhersage-Segmente:")
     for s in results:
         dur = s["duration_s"]
+
         def hhmmss(sec):
             # mini-display helper; lässt Stunden weg wenn unnötig
             sec = int(round(sec))
-            h = sec // 3600; m = (sec % 3600) // 60; sc = sec % 60
+            h = sec // 3600
+            m = (sec % 3600) // 60
+            sc = sec % 60
             return f"{h:d}:{m:02d}:{sc:02d}" if h > 0 else f"{m:d}:{sc:02d}"
+
         line = f"- {s['class']:20s}  {hhmmss(s['t0'])} → {hhmmss(s['t1'])}  ({dur:5.1f}s)"
         if s["class"] not in {"REST", "PAUSE", "WALKING", "RUNNING"}:
             # reps: NEU (ALT) — neu kommt aus Handler, alt ist Basiszählung
@@ -905,12 +267,13 @@ def main():
                     "duration_s": s["duration_s"],
                     "class": s["class"],
                     "reps": int(s["reps"]),                 # alt/basis
-                    "reps_refined": int(s["reps_refined"])  # neu/handler
+                    "reps_refined": int(s["reps_refined"])  # neu/handler (hier = basis)
                 }
                 for s in results
             ]
         }, f, ensure_ascii=False, indent=2)
     print(f"\nErgebnis gespeichert: {out_json}")
+
 
 if __name__ == "__main__":
     main()
