@@ -5,30 +5,36 @@ import hashlib
 from pathlib import Path
 from functools import lru_cache
 
-import requests  # NEW
+import requests
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
 import numpy as np
 import pandas as pd
 
-from src.model.classifier import load_model, predict_features
-from src.predict_workout import (
+from src.model.classifier import load_model, predict_features  # :contentReference[oaicite:1]{index=1}
+from src.features.legacy_features import build_windows         # :contentReference[oaicite:2]{index=2}
+
+from src.segmentation.postprocessing import (
     smooth_probs_over_time,
     debounce_labels,
-    segment_from_window_preds,
     merge_short_segments,
     strength_classes_from,
-    select_rep_signal,
-    estimate_rep_period_acf,
-    count_reps_peak_trough,
+)  # :contentReference[oaicite:3]{index=3}
+
+from src.segmentation.decoder import StateMachineSegmenter, DecoderConfig  # :contentReference[oaicite:4]{index=4}
+from src.segmentation.exercise_gate import exercise_gate, ExerciseGateConfig  # :contentReference[oaicite:5]{index=5}
+from src.segmentation.adjacency_resolver import resolve_adjacent_strength, AdjacencyResolverConfig  # :contentReference[oaicite:6]{index=6}
+
+from src.segmentation.reps import (
     moving_average,
     mad,
-    rep_params_for_class,
-)
-from src.segmentation.postprocessing import apply_post_filters, POST_DEFAULTS
-from src.features.legacy_features import build_windows
+    select_rep_signal,
+    count_peaks,          # legacy fallback
+    count_reps_adaptive,  # NEW robust reps
+)  # 
 
 
 def read_jsonl_from_io(fobj: io.StringIO):
@@ -43,11 +49,10 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_MODEL = HERE / "artifacts" / "model.json"
 MODEL_PATH = os.environ.get("MODEL_PATH", str(DEFAULT_MODEL))
 
-# Optional: Grenzen/Timeouts fürs Downloaden
 ARTIFACT_DL_TIMEOUT_S = float(os.environ.get("ARTIFACT_DL_TIMEOUT_S", "15"))
-ARTIFACT_MAX_BYTES = int(os.environ.get("ARTIFACT_MAX_BYTES", str(5_000_000)))  # 5 MB default
+ARTIFACT_MAX_BYTES = int(os.environ.get("ARTIFACT_MAX_BYTES", str(5_000_000)))  # 5 MB
 
-app = FastAPI(title="Bangle Workout API", version="1.2")
+app = FastAPI(title="Bangle Workout API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,20 +95,15 @@ def _sha256(s: str) -> str:
 
 
 def _download_signed_url_to_tmp(url: str) -> Path:
-    """
-    Lädt signed URL nach /tmp und gibt Pfad zurück.
-    Dateiname deterministisch via sha256(url), damit Cache + Reuse funktioniert.
-    """
     url_hash = _sha256(url)[:16]
     out_path = Path("/tmp") / f"model_{url_hash}.json"
 
-    # Wenn schon vorhanden, nicht erneut laden
     if out_path.exists() and out_path.stat().st_size > 0:
         return out_path
 
     try:
         with requests.get(url, stream=True, timeout=ARTIFACT_DL_TIMEOUT_S) as r:
-            if r.status_code == 403 or r.status_code == 401:
+            if r.status_code in (401, 403):
                 raise HTTPException(status_code=401, detail="Signed URL not authorized/expired")
             if r.status_code == 404:
                 raise HTTPException(status_code=404, detail="Signed URL not found")
@@ -131,10 +131,6 @@ def _download_signed_url_to_tmp(url: str) -> Path:
 
 @lru_cache(maxsize=8)
 def _load_model_from_signed_url_cached(url: str) -> dict:
-    """
-    Cachet Modelle pro signed URL (Achtung: signed URLs ändern sich je nach TTL).
-    Das ist ok: du bekommst dann pro URL einen Cache-Eintrag.
-    """
     path = _download_signed_url_to_tmp(url)
     return load_model(str(path))
 
@@ -148,142 +144,213 @@ def resolve_model(artifact_url: str | None):
     return MODEL_OBJ, "universal", f"default:{MODEL_PATH}"
 
 
-def _run_predict(df: pd.DataFrame, M: dict, **kwargs):
+def ensure_time_and_required_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # meta-lines raus
+    if "type" in df.columns:
+        df = df[~(df["type"].astype(str) == "meta")].copy()
+
+    # time
+    if "t" in df.columns:
+        df["t"] = pd.to_numeric(df["t"], errors="coerce")
+    elif "t_rel" in df.columns:
+        t_rel = pd.to_numeric(df["t_rel"], errors="coerce")
+        valid = t_rel[t_rel.notna()]
+        if valid.empty:
+            raise HTTPException(status_code=400, detail="No valid time values in 't_rel'")
+        df = df.copy()
+        df["t"] = t_rel - float(valid.iloc[0])
+    else:
+        raise HTTPException(status_code=400, detail="No time column: expected 't' or 't_rel'")
+
+    # required sensor cols (baro ist in deinen Features REQUIRED)
+    required = ["t", "ax", "ay", "az", "baro"]
+    for c in required:
+        if c not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Missing column '{c}'")
+
+    for c in ["t", "ax", "ay", "az", "baro"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["t", "ax", "ay", "az", "baro"]).sort_values("t").reset_index(drop=True)
+
+    # optional ignore hr/steps
+    for col in ("hr", "steps"):
+        if col in df.columns:
+            df = df.drop(columns=[col])
+
+    return df
+
+
+def merge_consecutive_rest(segments: list[dict]) -> list[dict]:
+    if not segments:
+        return []
+    out = [dict(segments[0])]
+    for seg in segments[1:]:
+        cur = dict(seg)
+        prev = out[-1]
+        if str(prev.get("class", "")).upper() == "REST" and str(cur.get("class", "")).upper() == "REST":
+            prev["t1"] = float(max(float(prev["t1"]), float(cur["t1"])))
+            prev["duration_s"] = float(prev["t1"] - prev["t0"])
+            if "i0" in prev and "i1" in prev and "i0" in cur and "i1" in cur:
+                prev["i1"] = int(max(int(prev["i1"]), int(cur["i1"])))
+        else:
+            out.append(cur)
+    return out
+
+
+def _run_predict_new_pipeline(df: pd.DataFrame, M: dict, **kwargs):
     classes = M["classes"]
     fs = float(M["meta"]["fs_hz"])
     winS = float(M["meta"]["win_s"])
     hopS = float(M["meta"]["hop_s"])
 
-    if "type" in df.columns:
-        df = df[~(df["type"].astype(str) == "meta")].copy()
+    df = ensure_time_and_required_columns(df)
 
-    if "t" not in df.columns:
-        if "t_rel" in df.columns:
-            t_rel = pd.to_numeric(df["t_rel"], errors="coerce")
-            valid = t_rel[t_rel.notna()]
-            if not valid.empty:
-                t0 = valid.iloc[0]
-                df["t"] = t_rel - t0
-            else:
-                df["t"] = np.nan
-        else:
-            raise HTTPException(status_code=400, detail="No time column: expected 't' or 't_rel'")
-
-    for col in ["t", "ax", "ay", "az"]:
-        if col not in df.columns:
-            raise HTTPException(status_code=400, detail=f"Missing column '{col}'")
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["t", "ax", "ay", "az"]).sort_values("t").reset_index(drop=True)
-
-    X, _, t0s, _feat_names = build_windows(df, fs, winS, hopS)
+    X, _, t0s, feat_names = build_windows(df, fs, winS, hopS)
     if X.shape[0] == 0:
         return [], fs, winS, hopS
 
     model_feats = M.get("feature_names", [])
-    if len(model_feats) != X.shape[1]:
+    if model_feats and len(model_feats) != X.shape[1]:
         raise HTTPException(
             status_code=500,
             detail=f"Feature mismatch: model expects {len(model_feats)} but build_windows produced {X.shape[1]}",
         )
 
-    cls_idx, probs = predict_features(X, M)
-    probs_s = smooth_probs_over_time(probs, k=max(1, int(kwargs.get("prob_smooth_k", 5))))
-    cls_idx = np.argmax(probs_s, axis=1)
-    cls_idx = debounce_labels(cls_idx, min_run=max(1, int(kwargs.get("debounce_run", 3))))
+    # window prediction
+    _, probs = predict_features(X, M)
 
-    segments = segment_from_window_preds(t0s, cls_idx, classes, winS)
+    # smooth + debounce
+    prob_smooth_k = max(1, int(kwargs.get("prob_smooth_k", 5)))
+    debounce_run = max(1, int(kwargs.get("debounce_run", 3)))
     merge_min_s = float(kwargs.get("merge_min_s", 4.0))
-    if merge_min_s and merge_min_s > 0:
-        segments = merge_short_segments(segments, min_len_s=merge_min_s, prefer="neighbor")
+
+    probs_s = smooth_probs_over_time(probs, k=prob_smooth_k)
+    cls_idx = np.argmax(probs_s, axis=1)
+    cls_idx = debounce_labels(cls_idx, min_run=debounce_run)
 
     strength_classes = strength_classes_from(M)
+
+    # decoder config (defaults wie in predict_workout.py neu)
+    dec_cfg = DecoderConfig(
+        start_hold_w=int(kwargs.get("dec_start_hold_w", 2)),
+        end_hold_w=int(kwargs.get("dec_end_hold_w", 3)),
+        q_strength_start=float(kwargs.get("dec_q_strength_start", 0.55)),
+        q_rest_end=float(kwargs.get("dec_q_rest_end", 0.70)),
+        q_motion_low=float(kwargs.get("dec_q_motion_low", 0.40)),
+        min_set_s=float(kwargs.get("dec_min_set_s", 12.0)),
+        min_rest_s=float(kwargs.get("dec_min_rest_s", 20.0)),
+        debug=bool(kwargs.get("dec_debug", False)),
+    )
+    decoder = StateMachineSegmenter(classes=classes, strength_classes=strength_classes, cfg=dec_cfg)
+    segments = decoder.decode(
+        df=df,
+        probs_s=probs_s,
+        t0s=np.asarray(t0s, float),
+        win_s=winS,
+        hop_s=hopS,
+        fs=fs,
+    )
+
+    # merge short
+    if merge_min_s > 0:
+        segments = merge_short_segments(segments, min_len_s=merge_min_s, prefer="neighbor")
+
+    # exercise gate (adaptive; legacy params werden gemappt)
+    gcfg = ExerciseGateConfig(
+        min_set_s=float(kwargs.get("gate_min_set_s", 18.0)),
+        min_mean_conf=float(kwargs.get("gate_min_mean", 0.55)),
+        min_peak_conf=float(kwargs.get("gate_min_peak", 0.70)),
+        debug=bool(kwargs.get("gate_debug", False)),
+    )
+    segments = exercise_gate(
+        segments=segments,
+        probs_s=probs_s,
+        t0s=np.asarray(t0s, float),
+        classes=classes,
+        strength_classes=strength_classes,
+        cfg=gcfg,
+    )
+    segments = merge_short_segments(segments, min_len_s=0.0, prefer="neighbor")
+
+    # adjacency resolver
+    acfg = AdjacencyResolverConfig(
+        max_gap_s=float(kwargs.get("adj_max_gap_s", 0.1)),
+        rest_bridge_s=float(kwargs.get("adj_rest_bridge_s", 6.0)),
+        score_margin=float(kwargs.get("adj_score_margin", 0.10)),
+        min_combined_mean_conf=float(kwargs.get("adj_min_combined_mean", 0.55)),
+        debug=bool(kwargs.get("adj_debug", False)),
+    )
+    segments = resolve_adjacent_strength(
+        segments=segments,
+        probs_s=probs_s,
+        t0s=np.asarray(t0s, float),
+        classes=classes,
+        strength_classes=strength_classes,
+        cfg=acfg,
+    )
+    segments = merge_short_segments(segments, min_len_s=0.0, prefer="neighbor")
+    segments = merge_consecutive_rest(segments)
+
+    # reps
     t = df["t"].to_numpy(float)
     ax = df["ax"].to_numpy(float)
     ay = df["ay"].to_numpy(float)
     az = df["az"].to_numpy(float)
 
-    smooth_k = max(1, int(round(0.2 * fs)))
+    rep_mode = str(kwargs.get("rep_mode", "pair"))
+    smooth_sec = float(kwargs.get("smooth_sec", 0.2))
+    smooth_k = max(1, int(round(smooth_sec * fs)))
     az_smooth = moving_average(az, smooth_k)
 
-    rep_mode = kwargs.get("rep_mode", "pair")
-    rep_min_s = float(kwargs.get("rep_min_s", 0.6))
-    rep_max_s = float(kwargs.get("rep_max_s", 4.0))
-    rep_k = float(kwargs.get("rep_k", 0.6))
-    acf_enable = bool(kwargs.get("acf_enable", False))
+    rep_k = float(kwargs.get("rep_k", 0.7))
+    rep_min_s = float(kwargs.get("rep_min_s", 0.4))
+    rep_max_s = float(kwargs.get("rep_max_s", 3.5))
     acf_min_s = float(kwargs.get("acf_min_s", 0.45))
     acf_max_s = float(kwargs.get("acf_max_s", 3.0))
-    acf_band = kwargs.get("acf_band", (0.6, 1.8))
-
-    min_reps = int(kwargs.get("min_reps", 1))
-    below_min_policy = kwargs.get("below_min_policy", "keep")
+    min_peak_sep = float(kwargs.get("min_peak_sep", 0.4))
 
     results = []
     for seg in segments:
-        seg_class = seg["class"]
-        mask = (t >= seg["t0"]) & (t <= seg["t1"])
-        reps = 0
+        seg_class = str(seg["class"])
+        t0 = float(seg["t0"])
+        t1 = float(seg["t1"])
+        mask = (t >= t0) & (t <= t1)
 
+        reps = 0
         if seg_class in strength_classes and np.count_nonzero(mask) > 3:
             if rep_mode == "pair":
                 sig = select_rep_signal(ax[mask], ay[mask], az[mask], fs)
-                k0, min0, max0 = rep_params_for_class(seg_class, base_k=rep_k, base_min=rep_min_s, base_max=rep_max_s)
-
-                if acf_enable:
-                    p = estimate_rep_period_acf(sig, fs, min_s=acf_min_s, max_s=acf_max_s)
-                    if p > 0:
-                        lo, hi = acf_band
-                        min_s = max(0.35, min(p * lo, max0))
-                        max_s = max(min0, min(p * hi, max0))
-                    else:
-                        min_s, max_s = min0, max0
-                else:
-                    min_s, max_s = min0, max0
-
-                if min_s >= max_s:
-                    min_s, max_s = min0, max0
-
-                reps = count_reps_peak_trough(sig, fs, k=k0, min_rep_s=min_s, max_rep_s=max_s)
-                if reps == 0:
-                    reps = count_reps_peak_trough(sig, fs, k=max(0.25, k0 - 0.1), min_rep_s=min_s, max_rep_s=max_s)
+                reps, _dbg = count_reps_adaptive(
+                    sig,
+                    fs,
+                    base_k=rep_k,
+                    min_s=rep_min_s,
+                    max_s=rep_max_s,
+                    acf_min_s=acf_min_s,
+                    acf_max_s=acf_max_s,
+                )
             else:
-                from src.predict_workout import count_peaks
+                az_seg = az_smooth[mask]
                 reps = count_peaks(
-                    az_smooth[mask], fs,
-                    min_separation_s=0.4,
+                    az_seg,
+                    fs,
+                    min_separation_s=min_peak_sep,
                     thresh_mode="median_mad",
-                    prominence=0.5 * mad(az_smooth[mask]),
+                    prominence=0.5 * mad(az_seg),
                 )
 
-        out_class = seg_class
-        if seg_class in strength_classes:
-            if below_min_policy == "drop" and reps < min_reps:
-                continue
-            if below_min_policy == "rest" and reps < min_reps:
-                out_class = "REST"
-                reps = 0
-
         results.append({
-            "t0": float(seg["t0"]),
-            "t1": float(seg["t1"]),
-            "duration_s": float(seg["t1"] - seg["t0"]),
-            "class": out_class,
-            "reps": int(reps) if out_class not in {"REST", "PAUSE", "WALKING", "RUNNING"} else 0,
-            "i0": int(seg["i0"]),
-            "i1": int(seg["i1"]),
+            "t0": t0,
+            "t1": t1,
+            "duration_s": float(t1 - t0),
+            "class": seg_class,
+            "reps": int(reps) if seg_class in strength_classes else 0,
+            "reps_refined": int(reps) if seg_class in strength_classes else 0,
+            # keep indices if present (optional)
+            "i0": int(seg.get("i0", 0)),
+            "i1": int(seg.get("i1", 0)),
         })
-
-    pf_cfg = dict(POST_DEFAULTS)
-    pf_cfg.update(dict(
-        min_strength_duration_s=float(kwargs.get("post_min_strength_sec", POST_DEFAULTS["min_strength_duration_s"])),
-        min_rest_between_sets_s=float(kwargs.get("post_min_rest_between_sec", POST_DEFAULTS["min_rest_between_sets_s"])),
-        acf_peak_thr=float(kwargs.get("post_acf_peak_thr", POST_DEFAULTS["acf_peak_thr"])),
-        band_ratio_thr=float(kwargs.get("post_band_ratio_thr", POST_DEFAULTS["band_ratio_thr"])),
-        std_thr_g=float(kwargs.get("post_std_thr_g", POST_DEFAULTS["std_thr_g"])),
-        min_rep_density=float(kwargs.get("post_min_rep_density", POST_DEFAULTS["min_rep_density"])),
-        conf_thr=float(kwargs.get("post_conf_thr", POST_DEFAULTS["conf_thr"])),
-    ))
-    results = apply_post_filters(df, results, probs_s, classes, fs, strength_classes, cfg=pf_cfg)
 
     return results, fs, winS, hopS
 
@@ -303,42 +370,33 @@ def _load_model_once():
 @app.post("/predict", response_model=PredictResponse)
 async def predict_endpoint(
     workout_file: UploadFile = File(...),
-
-    # NEW: optional signed url to model.json
     artifact_url: str | None = Form(None),
 
-    # wie gehabt: Parameter
     prob_smooth_k: int = Form(5),
     debounce_run: int = Form(3),
     merge_min_s: float = Form(4.0),
+
+    # gate/adj knobs wie bisher (werden im neuen System gemappt)
+    gate_min_set_s: float = Form(18.0),
+    gate_min_mean: float = Form(0.55),
+    gate_min_peak: float = Form(0.70),
+
+    adj_rest_bridge_s: float = Form(6.0),
+    adj_score_margin: float = Form(0.10),
+    adj_min_combined_mean: float = Form(0.55),
+
+    # reps
     rep_mode: str = Form("pair"),
-    rep_min_s: float = Form(0.6),
-    rep_max_s: float = Form(4.0),
-    rep_k: float = Form(0.6),
-    acf_enable: bool = Form(False),
+    smooth_sec: float = Form(0.2),
+    min_peak_sep: float = Form(0.4),
+
+    rep_min_s: float = Form(0.4),
+    rep_max_s: float = Form(3.5),
+    rep_k: float = Form(0.7),
     acf_min_s: float = Form(0.45),
     acf_max_s: float = Form(3.0),
-    acf_band: str = Form("0.6,1.8"),
-    min_reps: int = Form(1),
-    below_min_policy: str = Form("keep"),
-
-    post_min_strength_sec: float = Form(8.0),
-    post_min_rest_between_sec: float = Form(10.0),
-    post_acf_peak_thr: float = Form(0.18),
-    post_band_ratio_thr: float = Form(0.35),
-    post_std_thr_g: float = Form(0.05),
-    post_min_rep_density: float = Form(0.25),
-    post_conf_thr: float = Form(0.50),
 ):
-    # Modell auswählen
     M, trained_on, artifact_ref = resolve_model(artifact_url)
-
-    # acf band parse
-    try:
-        lo, hi = [float(x) for x in acf_band.split(",")]
-        acf_band_tuple = (lo, hi)
-    except Exception:
-        acf_band_tuple = (0.6, 1.8)
 
     data = await workout_file.read()
     text = data.decode("utf-8", errors="ignore")
@@ -381,28 +439,28 @@ async def predict_endpoint(
     df = pd.DataFrame(rows)
 
     try:
-        segments, fs, winS, hopS = _run_predict(
+        segments, fs, winS, hopS = _run_predict_new_pipeline(
             df, M,
             prob_smooth_k=prob_smooth_k,
             debounce_run=debounce_run,
             merge_min_s=merge_min_s,
+
+            gate_min_set_s=gate_min_set_s,
+            gate_min_mean=gate_min_mean,
+            gate_min_peak=gate_min_peak,
+
+            adj_rest_bridge_s=adj_rest_bridge_s,
+            adj_score_margin=adj_score_margin,
+            adj_min_combined_mean=adj_min_combined_mean,
+
             rep_mode=rep_mode,
+            smooth_sec=smooth_sec,
+            min_peak_sep=min_peak_sep,
             rep_min_s=rep_min_s,
             rep_max_s=rep_max_s,
             rep_k=rep_k,
-            acf_enable=acf_enable,
             acf_min_s=acf_min_s,
             acf_max_s=acf_max_s,
-            acf_band=acf_band_tuple,
-            min_reps=min_reps,
-            below_min_policy=below_min_policy,
-            post_min_strength_sec=post_min_strength_sec,
-            post_min_rest_between_sec=post_min_rest_between_sec,
-            post_acf_peak_thr=post_acf_peak_thr,
-            post_band_ratio_thr=post_band_ratio_thr,
-            post_std_thr_g=post_std_thr_g,
-            post_min_rep_density=post_min_rep_density,
-            post_conf_thr=post_conf_thr,
         )
     except HTTPException:
         raise

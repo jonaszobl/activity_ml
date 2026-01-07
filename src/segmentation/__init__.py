@@ -1,12 +1,25 @@
 # src/segmentation/__init__.py
-from .reps import (
-    moving_average,
-    median,
-    mad,
-    count_peaks,
-    count_reps_peak_trough,
-    highpass_ma,
-    estimate_rep_period_acf,
-    select_rep_signal,
-    rep_params_for_class,
+
+from .postprocessing import (
+    smooth_probs_over_time,
+    debounce_labels,
+    merge_short_segments,
+    strength_classes_from,
 )
+
+from .decoder import StateMachineSegmenter, DecoderConfig
+from .exercise_gate import exercise_gate, ExerciseGateConfig
+from .adjacency_resolver import resolve_adjacent_strength, AdjacencyResolverConfig
+
+__all__ = [
+    "smooth_probs_over_time",
+    "debounce_labels",
+    "merge_short_segments",
+    "strength_classes_from",
+    "StateMachineSegmenter",
+    "DecoderConfig",
+    "exercise_gate",
+    "ExerciseGateConfig",
+    "resolve_adjacent_strength",
+    "AdjacencyResolverConfig",
+]
