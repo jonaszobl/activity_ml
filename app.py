@@ -91,7 +91,8 @@ def ensure_time_column_df(df: pd.DataFrame) -> pd.DataFrame:
         t = pd.to_numeric(df["t"], errors="coerce")
     elif "t_rel" in df.columns:
         t_rel = pd.to_numeric(df["t_rel"], errors="coerce")
-        t = t_rel - t_rel.iloc[0]
+        t0 = t_rel.dropna().iloc[0]
+        t = t_rel - t0
     else:
         raise HTTPException(status_code=400, detail="Neither 't' nor 't_rel' found in file")
 
@@ -452,6 +453,8 @@ async def predict_endpoint(
 
     data = await workout_file.read()
     rows = _parse_workout_bytes(data)
+    rows = [r for r in rows if r.get("type") not in ("meta", "meta_end")]
+
 
     if not rows:
         return PredictResponse(
